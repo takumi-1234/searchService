@@ -4,8 +4,9 @@ import "context"
 
 // SearchParamsは検索のパラメータです。
 type SearchParams struct {
-	IndexName string
-	QueryText string
+	IndexName   string
+	QueryText   string
+	QueryVector []float32
 }
 
 // SearchResultはビジネスロジックの検索結果です。

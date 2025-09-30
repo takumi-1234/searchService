@@ -74,3 +74,7 @@ func (r *elasticsearchRepository) KeywordSearch(ctx context.Context, indexName, 
 
 	return documents, nil
 }
+
+func (r *elasticsearchRepository) VectorSearch(ctx context.Context, indexName string, vector []float32) ([]port.Document, error) {
+	return nil, fmt.Errorf("VectorSearch is not implemented for elasticsearchRepository")
+}

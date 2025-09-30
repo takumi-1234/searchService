@@ -12,4 +12,5 @@ type Document struct {
 // SearchRepositoryはデータストアへのアクセスを抽象化します。
 type SearchRepository interface {
 	KeywordSearch(ctx context.Context, indexName, query string) ([]Document, error)
+	VectorSearch(ctx context.Context, indexName string, vector []float32) ([]Document, error)
 }

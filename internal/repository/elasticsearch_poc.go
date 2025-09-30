@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/takumi-1234/searchService/internal/port"
 )
@@ -26,4 +27,8 @@ func (r *elasticsearchPocRepository) KeywordSearch(ctx context.Context, indexNam
 			},
 		},
 	}, nil
+}
+
+func (r *elasticsearchPocRepository) VectorSearch(ctx context.Context, indexName string, vector []float32) ([]port.Document, error) {
+	return nil, fmt.Errorf("VectorSearch is not implemented for elasticsearchPocRepository")
 }
