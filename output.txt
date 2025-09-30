@@ -1,0 +1,1934 @@
+```markdown 
+# README.md
+
+```
+---
+```yaml 
+# buf.gen.yaml
+
+version: v1
+plugins:
+  - plugin: buf.build/protocolbuffers/go
+    out: gen
+    opt:
+      - paths=source_relative
+  - plugin: buf.build/grpc/go
+    out: gen
+    opt:
+      - paths=source_relative
+      - require_unimplemented_servers=false
+```
+---
+```yaml 
+# buf.yaml
+
+version: v1beta1
+build:
+  roots:
+    - api
+deps:
+  - buf.build/googleapis/googleapis
+lint:
+  use:
+    - DEFAULT
+```
+---
+```go 
+# cmd/server/main.go
+
+package main
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os/signal"
+	"syscall"
+
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
+
+	searchv1 "github.com/takumi-1234/searchService/gen/proto/search/v1"
+	grpc_adapter "github.com/takumi-1234/searchService/internal/adapter/grpc"
+	"github.com/takumi-1234/searchService/internal/repository"
+	"github.com/takumi-1234/searchService/internal/service"
+)
+
+func main() {
+	// 1. ロガーの初期化
+	logger, err := zap.NewProduction()
+	if err != nil {
+		panic(fmt.Sprintf("failed to initialize logger: %v", err))
+	}
+	defer logger.Sync()
+
+	logger.Info("starting search-service...")
+
+	// 2. 依存関係の注入 (DI)
+	// PoCではハードコードされたリポジトリを使用
+	pocRepo := repository.NewElasticsearchPocRepository()
+	searchSvc := service.NewSearchService(pocRepo, logger)
+	grpcServer := grpc_adapter.NewServer(searchSvc, logger)
+
+	// 3. gRPCサーバーのセットアップ
+	port := 50051
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		logger.Fatal("failed to listen", zap.Error(err))
+	}
+
+	s := grpc.NewServer()
+	searchv1.RegisterSearchServiceServer(s, grpcServer)
+
+	// gRPCサーバーリフレクションを有効にする
+	reflection.Register(s)
+
+	// 4. Graceful Shutdown のためのシグナルハンドリング
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// 5. gRPCサーバーを別ゴルーチンで起動
+	go func() {
+		logger.Info(fmt.Sprintf("gRPC server listening at %v", lis.Addr()))
+		if err := s.Serve(lis); err != nil {
+			logger.Fatal("failed to serve", zap.Error(err))
+		}
+	}()
+
+	// シャットダウンシグナルを待機
+	<-ctx.Done()
+
+	logger.Info("shutting down gRPC server...")
+	s.GracefulStop()
+	logger.Info("server gracefully stopped")
+}
+```
+---
+```yaml 
+# config/config.yaml
+
+```
+---
+```yaml 
+# deployments/kubernetes/deployment.yaml
+
+```
+---
+```yaml 
+# deployments/kubernetes/service.yaml
+
+```
+---
+```yaml 
+# docker-compose.yml
+
+version: '3.8'
+
+services:
+  search-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "50051:50051"
+    networks:
+      - search_net
+
+networks:
+  search_net:
+    driver: bridge```
+---
+```go 
+# file_output.go
+
+package main
+
+import (
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+const outputFile = "output.txt"
+
+func main() {
+	rootDir := "." // カレントディレクトリ
+	out, err := os.Create(outputFile)
+	if err != nil {
+		fmt.Println("出力ファイル作成エラー:", err)
+		return
+	}
+	defer out.Close()
+
+	err = filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if d.IsDir() {
+			if ignoreDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if shouldIgnorePath(path) {
+			return nil
+		}
+
+		if isBinaryFile(path) || filepath.Base(path) == outputFile {
+			return nil
+		}
+
+		lang := detectLanguage(path)
+		if lang == "" {
+			return nil
+		}
+
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+
+		fmt.Fprintf(out, "```%s \n# %s\n\n", lang, path)
+		out.Write(content)
+		fmt.Fprintln(out, "```")
+		fmt.Fprintln(out, "---")
+
+		return nil
+	})
+
+	if err != nil {
+		fmt.Println("エラー:", err)
+	} else {
+		fmt.Println("出力完了:", outputFile)
+	}
+}
+
+var ignoreDirs = map[string]bool{
+	".git":           true,
+	"node_modules":   true,
+	"vendor":         true,
+	".vscode":        true,
+	"dist":           true,
+	"build":          true,
+	".idea":          true,
+	"tmp":            true,
+	"uploads":        true,
+	".next":          true,
+	".github":        true,
+	".pytest_cache":  true,
+	"test_resources": true,
+	"venv":           true,
+}
+
+func shouldIgnorePath(path string) bool {
+	lower := strings.ToLower(path)
+	return strings.Contains(lower, "min.js") ||
+		strings.Contains(lower, ".lock") ||
+		strings.Contains(lower, ".DS_Store")
+}
+
+func detectLanguage(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".go":
+		return "go"
+	case ".toml":
+		return "toml"
+	case ".env":
+		return "dotenv"
+	case ".yml", ".yaml":
+		return "yaml"
+	case ".json":
+		return "json"
+	case ".md":
+		return "markdown"
+	case ".txt":
+		return "text"
+	case ".sh":
+		return "bash"
+	case ".Dockerfile", "dockerfile":
+		return "Dockerfile"
+	case ".gitignore":
+		return ""
+	case ".makefile", "makefile":
+		return "makefile"
+	case ".html":
+		return "html"
+	case ".js":
+		return "javascript"
+	case ".ts":
+		return "typescript"
+	case ".jsx":
+		return "jsx"
+	case ".tsx":
+		return "tsx"
+	case ".sql":
+		return "sql"
+	default:
+		return ""
+	}
+}
+
+var binaryExts = map[string]bool{
+	".exe":  true,
+	".dll":  true,
+	".so":   true,
+	".bin":  true,
+	".jpg":  true,
+	".jpeg": true,
+	".png":  true,
+	".gif":  true,
+	".pdf":  true,
+	".zip":  true,
+	".tar":  true,
+	".gz":   true,
+	".7z":   true,
+	".mp3":  true,
+	".mp4":  true,
+	".avi":  true,
+	".mov":  true,
+	".wav":  true,
+	".ico":  true,
+}
+
+func isBinaryFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	return binaryExts[ext]
+}
+```
+---
+```go 
+# gen/proto/search/v1/search.pb.go
+
+// Code generated by protoc-gen-go. DO NOT EDIT.
+// versions:
+// 	protoc-gen-go v1.36.9
+// 	protoc        (unknown)
+// source: proto/search/v1/search.proto
+
+package searchv1
+
+import (
+	_ "google.golang.org/genproto/googleapis/api/annotations"
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	structpb "google.golang.org/protobuf/types/known/structpb"
+	reflect "reflect"
+	sync "sync"
+	unsafe "unsafe"
+)
+
+const (
+	// Verify that this generated code is sufficiently up-to-date.
+	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
+	// Verify that runtime/protoimpl is sufficiently up-to-date.
+	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
+)
+
+type Filter_Operator int32
+
+const (
+	Filter_OPERATOR_UNSPECIFIED  Filter_Operator = 0
+	Filter_OPERATOR_EQUAL        Filter_Operator = 1
+	Filter_OPERATOR_NOT_EQUAL    Filter_Operator = 2
+	Filter_OPERATOR_GREATER_THAN Filter_Operator = 3
+	Filter_OPERATOR_LESS_THAN    Filter_Operator = 4
+)
+
+// Enum value maps for Filter_Operator.
+var (
+	Filter_Operator_name = map[int32]string{
+		0: "OPERATOR_UNSPECIFIED",
+		1: "OPERATOR_EQUAL",
+		2: "OPERATOR_NOT_EQUAL",
+		3: "OPERATOR_GREATER_THAN",
+		4: "OPERATOR_LESS_THAN",
+	}
+	Filter_Operator_value = map[string]int32{
+		"OPERATOR_UNSPECIFIED":  0,
+		"OPERATOR_EQUAL":        1,
+		"OPERATOR_NOT_EQUAL":    2,
+		"OPERATOR_GREATER_THAN": 3,
+		"OPERATOR_LESS_THAN":    4,
+	}
+)
+
+func (x Filter_Operator) Enum() *Filter_Operator {
+	p := new(Filter_Operator)
+	*p = x
+	return p
+}
+
+func (x Filter_Operator) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (Filter_Operator) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_search_v1_search_proto_enumTypes[0].Descriptor()
+}
+
+func (Filter_Operator) Type() protoreflect.EnumType {
+	return &file_proto_search_v1_search_proto_enumTypes[0]
+}
+
+func (x Filter_Operator) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use Filter_Operator.Descriptor instead.
+func (Filter_Operator) EnumDescriptor() ([]byte, []int) {
+	return file_proto_search_v1_search_proto_rawDescGZIP(), []int{4, 0}
+}
+
+type SortBy_Order int32
+
+const (
+	SortBy_ORDER_UNSPECIFIED SortBy_Order = 0
+	SortBy_ORDER_ASC         SortBy_Order = 1
+	SortBy_ORDER_DESC        SortBy_Order = 2
+)
+
+// Enum value maps for SortBy_Order.
+var (
+	SortBy_Order_name = map[int32]string{
+		0: "ORDER_UNSPECIFIED",
+		1: "ORDER_ASC",
+		2: "ORDER_DESC",
+	}
+	SortBy_Order_value = map[string]int32{
+		"ORDER_UNSPECIFIED": 0,
+		"ORDER_ASC":         1,
+		"ORDER_DESC":        2,
+	}
+)
+
+func (x SortBy_Order) Enum() *SortBy_Order {
+	p := new(SortBy_Order)
+	*p = x
+	return p
+}
+
+func (x SortBy_Order) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SortBy_Order) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_search_v1_search_proto_enumTypes[1].Descriptor()
+}
+
+func (SortBy_Order) Type() protoreflect.EnumType {
+	return &file_proto_search_v1_search_proto_enumTypes[1]
+}
+
+func (x SortBy_Order) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SortBy_Order.Descriptor instead.
+func (SortBy_Order) EnumDescriptor() ([]byte, []int) {
+	return file_proto_search_v1_search_proto_rawDescGZIP(), []int{5, 0}
+}
+
+type FieldDefinition_FieldType int32
+
+const (
+	FieldDefinition_FIELD_TYPE_UNSPECIFIED FieldDefinition_FieldType = 0
+	FieldDefinition_FIELD_TYPE_TEXT        FieldDefinition_FieldType = 1
+	FieldDefinition_FIELD_TYPE_KEYWORD     FieldDefinition_FieldType = 2
+	FieldDefinition_FIELD_TYPE_INTEGER     FieldDefinition_FieldType = 3
+	FieldDefinition_FIELD_TYPE_FLOAT       FieldDefinition_FieldType = 4
+	FieldDefinition_FIELD_TYPE_BOOLEAN     FieldDefinition_FieldType = 5
+	FieldDefinition_FIELD_TYPE_DATE        FieldDefinition_FieldType = 6
+)
+
+// Enum value maps for FieldDefinition_FieldType.
+var (
+	FieldDefinition_FieldType_name = map[int32]string{
+		0: "FIELD_TYPE_UNSPECIFIED",
+		1: "FIELD_TYPE_TEXT",
+		2: "FIELD_TYPE_KEYWORD",
+		3: "FIELD_TYPE_INTEGER",
+		4: "FIELD_TYPE_FLOAT",
+		5: "FIELD_TYPE_BOOLEAN",
+		6: "FIELD_TYPE_DATE",
+	}
+	FieldDefinition_FieldType_value = map[string]int32{
+		"FIELD_TYPE_UNSPECIFIED": 0,
+		"FIELD_TYPE_TEXT":        1,
+		"FIELD_TYPE_KEYWORD":     2,
+		"FIELD_TYPE_INTEGER":     3,
+		"FIELD_TYPE_FLOAT":       4,
+		"FIELD_TYPE_BOOLEAN":     5,
+		"FIELD_TYPE_DATE":        6,
+	}
+)
+
+func (x FieldDefinition_FieldType) Enum() *FieldDefinition_FieldType {
+	p := new(FieldDefinition_FieldType)
+	*p = x
+	return p
+}
+
+func (x FieldDefinition_FieldType) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (FieldDefinition_FieldType) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_search_v1_search_proto_enumTypes[2].Descriptor()
+}
+
+func (FieldDefinition_FieldType) Type() protoreflect.EnumType {
+	return &file_proto_search_v1_search_proto_enumTypes[2]
+}
+
+func (x FieldDefinition_FieldType) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use FieldDefinition_FieldType.Descriptor instead.
+func (FieldDefinition_FieldType) EnumDescriptor() ([]byte, []int) {
+	return file_proto_search_v1_search_proto_rawDescGZIP(), []int{8, 0}
+}
+
+type VectorConfig_Distance int32
+
+const (
+	VectorConfig_DISTANCE_UNSPECIFIED VectorConfig_Distance = 0
+	VectorConfig_DISTANCE_COSINE      VectorConfig_Distance = 1
+	VectorConfig_DISTANCE_EUCLID      VectorConfig_Distance = 2
+	VectorConfig_DISTANCE_DOT_PRODUCT VectorConfig_Distance = 3
+)
+
+// Enum value maps for VectorConfig_Distance.
+var (
+	VectorConfig_Distance_name = map[int32]string{
+		0: "DISTANCE_UNSPECIFIED",
+		1: "DISTANCE_COSINE",
+		2: "DISTANCE_EUCLID",
+		3: "DISTANCE_DOT_PRODUCT",
+	}
+	VectorConfig_Distance_value = map[string]int32{
+		"DISTANCE_UNSPECIFIED": 0,
+		"DISTANCE_COSINE":      1,
+		"DISTANCE_EUCLID":      2,
+		"DISTANCE_DOT_PRODUCT": 3,
+	}
+)
+
+func (x VectorConfig_Distance) Enum() *VectorConfig_Distance {
+	p := new(VectorConfig_Distance)
+	*p = x
+	return p
+}
+
+func (x VectorConfig_Distance) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (VectorConfig_Distance) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_search_v1_search_proto_enumTypes[3].Descriptor()
+}
+
+func (VectorConfig_Distance) Type() protoreflect.EnumType {
+	return &file_proto_search_v1_search_proto_enumTypes[3]
+}
+
+func (x VectorConfig_Distance) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use VectorConfig_Distance.Descriptor instead.
+func (VectorConfig_Distance) EnumDescriptor() ([]byte, []int) {
+	return file_proto_search_v1_search_proto_rawDescGZIP(), []int{9, 0}
+}
+
+type SearchDocumentsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 検索対象のインデックス名 (例: "exams")
+	IndexName string `protobuf:"bytes,1,opt,name=index_name,json=indexName,proto3" json:"index_name,omitempty"`
+	// 検索クエリ文字列
+	QueryText string `protobuf:"bytes,2,opt,name=query_text,json=queryText,proto3" json:"query_text,omitempty"`
+	// 検索クエリベクトル
+	QueryVector []float32 `protobuf:"fixed32,3,rep,packed,name=query_vector,json=queryVector,proto3" json:"query_vector,omitempty"`
+	// フィルタ条件
+	Filters []*Filter `protobuf:"bytes,4,rep,name=filters,proto3" json:"filters,omitempty"`
+	// ソート条件
+	SortBy *SortBy `protobuf:"bytes,5,opt,name=sort_by,json=sortBy,proto3" json:"sort_by,omitempty"`
+	// 1ページあたりの結果数
+	PageSize int32 `protobuf:"varint,6,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	// 次ページのトークン
+	PageToken     string `protobuf:"bytes,7,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SearchDocumentsRequest) Reset() {
+	*x = SearchDocumentsRequest{}
+	mi := &file_proto_search_v1_search_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SearchDocumentsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SearchDocumentsRequest) ProtoMessage() {}
+
+func (x *SearchDocumentsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_search_v1_search_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SearchDocumentsRequest.ProtoReflect.Descriptor instead.
+func (*SearchDocumentsRequest) Descriptor() ([]byte, []int) {
+	return file_proto_search_v1_search_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *SearchDocumentsRequest) GetIndexName() string {
+	if x != nil {
+		return x.IndexName
+	}
+	return ""
+}
+
+func (x *SearchDocumentsRequest) GetQueryText() string {
+	if x != nil {
+		return x.QueryText
+	}
+	return ""
+}
+
+func (x *SearchDocumentsRequest) GetQueryVector() []float32 {
+	if x != nil {
+		return x.QueryVector
+	}
+	return nil
+}
+
+func (x *SearchDocumentsRequest) GetFilters() []*Filter {
+	if x != nil {
+		return x.Filters
+	}
+	return nil
+}
+
+func (x *SearchDocumentsRequest) GetSortBy() *SortBy {
+	if x != nil {
+		return x.SortBy
+	}
+	return nil
+}
+
+func (x *SearchDocumentsRequest) GetPageSize() int32 {
+	if x != nil {
+		return x.PageSize
+	}
+	return 0
+}
+
+func (x *SearchDocumentsRequest) GetPageToken() string {
+	if x != nil {
+		return x.PageToken
+	}
+	return ""
+}
+
+type SearchDocumentsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 検索結果のリスト
+	Results []*SearchResult `protobuf:"bytes,1,rep,name=results,proto3" json:"results,omitempty"`
+	// 総ヒット件数
+	TotalCount int64 `protobuf:"varint,2,opt,name=total_count,json=totalCount,proto3" json:"total_count,omitempty"`
+	// 次ページのトークン
+	NextPageToken string `protobuf:"bytes,3,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SearchDocumentsResponse) Reset() {
+	*x = SearchDocumentsResponse{}
+	mi := &file_proto_search_v1_search_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SearchDocumentsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SearchDocumentsResponse) ProtoMessage() {}
+
+func (x *SearchDocumentsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_search_v1_search_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SearchDocumentsResponse.ProtoReflect.Descriptor instead.
+func (*SearchDocumentsResponse) Descriptor() ([]byte, []int) {
+	return file_proto_search_v1_search_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *SearchDocumentsResponse) GetResults() []*SearchResult {
+	if x != nil {
+		return x.Results
+	}
+	return nil
+}
+
+func (x *SearchDocumentsResponse) GetTotalCount() int64 {
+	if x != nil {
+		return x.TotalCount
+	}
+	return 0
+}
+
+func (x *SearchDocumentsResponse) GetNextPageToken() string {
+	if x != nil {
+		return x.NextPageToken
+	}
+	return ""
+}
+
+type CreateIndexRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 作成するインデックス名
+	IndexName string `protobuf:"bytes,1,opt,name=index_name,json=indexName,proto3" json:"index_name,omitempty"`
+	// インデックスのスキーマ定義
+	Schema        *IndexSchema `protobuf:"bytes,2,opt,name=schema,proto3" json:"schema,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CreateIndexRequest) Reset() {
+	*x = CreateIndexRequest{}
+	mi := &file_proto_search_v1_search_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateIndexRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateIndexRequest) ProtoMessage() {}
+
+func (x *CreateIndexRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_search_v1_search_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateIndexRequest.ProtoReflect.Descriptor instead.
+func (*CreateIndexRequest) Descriptor() ([]byte, []int) {
+	return file_proto_search_v1_search_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *CreateIndexRequest) GetIndexName() string {
+	if x != nil {
+		return x.IndexName
+	}
+	return ""
+}
+
+func (x *CreateIndexRequest) GetSchema() *IndexSchema {
+	if x != nil {
+		return x.Schema
+	}
+	return nil
+}
+
+type CreateIndexResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 成功したかどうか
+	Success bool `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	// メッセージ
+	Message       string `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CreateIndexResponse) Reset() {
+	*x = CreateIndexResponse{}
+	mi := &file_proto_search_v1_search_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateIndexResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateIndexResponse) ProtoMessage() {}
+
+func (x *CreateIndexResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_search_v1_search_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateIndexResponse.ProtoReflect.Descriptor instead.
+func (*CreateIndexResponse) Descriptor() ([]byte, []int) {
+	return file_proto_search_v1_search_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *CreateIndexResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *CreateIndexResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+type Filter struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Field         string                 `protobuf:"bytes,1,opt,name=field,proto3" json:"field,omitempty"`
+	Operator      Filter_Operator        `protobuf:"varint,2,opt,name=operator,proto3,enum=api.proto.search.v1.Filter_Operator" json:"operator,omitempty"`
+	Value         *structpb.Value        `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Filter) Reset() {
+	*x = Filter{}
+	mi := &file_proto_search_v1_search_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Filter) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Filter) ProtoMessage() {}
+
+func (x *Filter) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_search_v1_search_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Filter.ProtoReflect.Descriptor instead.
+func (*Filter) Descriptor() ([]byte, []int) {
+	return file_proto_search_v1_search_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *Filter) GetField() string {
+	if x != nil {
+		return x.Field
+	}
+	return ""
+}
+
+func (x *Filter) GetOperator() Filter_Operator {
+	if x != nil {
+		return x.Operator
+	}
+	return Filter_OPERATOR_UNSPECIFIED
+}
+
+func (x *Filter) GetValue() *structpb.Value {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+type SortBy struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Field         string                 `protobuf:"bytes,1,opt,name=field,proto3" json:"field,omitempty"`
+	Order         SortBy_Order           `protobuf:"varint,2,opt,name=order,proto3,enum=api.proto.search.v1.SortBy_Order" json:"order,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SortBy) Reset() {
+	*x = SortBy{}
+	mi := &file_proto_search_v1_search_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SortBy) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SortBy) ProtoMessage() {}
+
+func (x *SortBy) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_search_v1_search_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SortBy.ProtoReflect.Descriptor instead.
+func (*SortBy) Descriptor() ([]byte, []int) {
+	return file_proto_search_v1_search_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *SortBy) GetField() string {
+	if x != nil {
+		return x.Field
+	}
+	return ""
+}
+
+func (x *SortBy) GetOrder() SortBy_Order {
+	if x != nil {
+		return x.Order
+	}
+	return SortBy_ORDER_UNSPECIFIED
+}
+
+type SearchResult struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// ドキュメントID
+	DocumentId string `protobuf:"bytes,1,opt,name=document_id,json=documentId,proto3" json:"document_id,omitempty"`
+	// 関連度スコア
+	Score float32 `protobuf:"fixed32,2,opt,name=score,proto3" json:"score,omitempty"`
+	// ドキュメントのフィールド内容
+	Fields        *structpb.Struct `protobuf:"bytes,3,opt,name=fields,proto3" json:"fields,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SearchResult) Reset() {
+	*x = SearchResult{}
+	mi := &file_proto_search_v1_search_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SearchResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SearchResult) ProtoMessage() {}
+
+func (x *SearchResult) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_search_v1_search_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SearchResult.ProtoReflect.Descriptor instead.
+func (*SearchResult) Descriptor() ([]byte, []int) {
+	return file_proto_search_v1_search_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *SearchResult) GetDocumentId() string {
+	if x != nil {
+		return x.DocumentId
+	}
+	return ""
+}
+
+func (x *SearchResult) GetScore() float32 {
+	if x != nil {
+		return x.Score
+	}
+	return 0
+}
+
+func (x *SearchResult) GetFields() *structpb.Struct {
+	if x != nil {
+		return x.Fields
+	}
+	return nil
+}
+
+type IndexSchema struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// フィールド定義
+	Fields []*FieldDefinition `protobuf:"bytes,1,rep,name=fields,proto3" json:"fields,omitempty"`
+	// ベクトル設定
+	VectorConfig  *VectorConfig `protobuf:"bytes,2,opt,name=vector_config,json=vectorConfig,proto3" json:"vector_config,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *IndexSchema) Reset() {
+	*x = IndexSchema{}
+	mi := &file_proto_search_v1_search_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *IndexSchema) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*IndexSchema) ProtoMessage() {}
+
+func (x *IndexSchema) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_search_v1_search_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use IndexSchema.ProtoReflect.Descriptor instead.
+func (*IndexSchema) Descriptor() ([]byte, []int) {
+	return file_proto_search_v1_search_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *IndexSchema) GetFields() []*FieldDefinition {
+	if x != nil {
+		return x.Fields
+	}
+	return nil
+}
+
+func (x *IndexSchema) GetVectorConfig() *VectorConfig {
+	if x != nil {
+		return x.VectorConfig
+	}
+	return nil
+}
+
+type FieldDefinition struct {
+	state         protoimpl.MessageState    `protogen:"open.v1"`
+	Name          string                    `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Type          FieldDefinition_FieldType `protobuf:"varint,2,opt,name=type,proto3,enum=api.proto.search.v1.FieldDefinition_FieldType" json:"type,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FieldDefinition) Reset() {
+	*x = FieldDefinition{}
+	mi := &file_proto_search_v1_search_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FieldDefinition) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FieldDefinition) ProtoMessage() {}
+
+func (x *FieldDefinition) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_search_v1_search_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FieldDefinition.ProtoReflect.Descriptor instead.
+func (*FieldDefinition) Descriptor() ([]byte, []int) {
+	return file_proto_search_v1_search_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *FieldDefinition) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *FieldDefinition) GetType() FieldDefinition_FieldType {
+	if x != nil {
+		return x.Type
+	}
+	return FieldDefinition_FIELD_TYPE_UNSPECIFIED
+}
+
+type VectorConfig struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Dimension     int32                  `protobuf:"varint,1,opt,name=dimension,proto3" json:"dimension,omitempty"`
+	Distance      VectorConfig_Distance  `protobuf:"varint,2,opt,name=distance,proto3,enum=api.proto.search.v1.VectorConfig_Distance" json:"distance,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VectorConfig) Reset() {
+	*x = VectorConfig{}
+	mi := &file_proto_search_v1_search_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VectorConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VectorConfig) ProtoMessage() {}
+
+func (x *VectorConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_search_v1_search_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VectorConfig.ProtoReflect.Descriptor instead.
+func (*VectorConfig) Descriptor() ([]byte, []int) {
+	return file_proto_search_v1_search_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *VectorConfig) GetDimension() int32 {
+	if x != nil {
+		return x.Dimension
+	}
+	return 0
+}
+
+func (x *VectorConfig) GetDistance() VectorConfig_Distance {
+	if x != nil {
+		return x.Distance
+	}
+	return VectorConfig_DISTANCE_UNSPECIFIED
+}
+
+var File_proto_search_v1_search_proto protoreflect.FileDescriptor
+
+const file_proto_search_v1_search_proto_rawDesc = "" +
+	"\n" +
+	"\x1cproto/search/v1/search.proto\x12\x13api.proto.search.v1\x1a\x1cgoogle/api/annotations.proto\x1a\x1cgoogle/protobuf/struct.proto\"\xa2\x02\n" +
+	"\x16SearchDocumentsRequest\x12\x1d\n" +
+	"\n" +
+	"index_name\x18\x01 \x01(\tR\tindexName\x12\x1d\n" +
+	"\n" +
+	"query_text\x18\x02 \x01(\tR\tqueryText\x12!\n" +
+	"\fquery_vector\x18\x03 \x03(\x02R\vqueryVector\x125\n" +
+	"\afilters\x18\x04 \x03(\v2\x1b.api.proto.search.v1.FilterR\afilters\x124\n" +
+	"\asort_by\x18\x05 \x01(\v2\x1b.api.proto.search.v1.SortByR\x06sortBy\x12\x1b\n" +
+	"\tpage_size\x18\x06 \x01(\x05R\bpageSize\x12\x1d\n" +
+	"\n" +
+	"page_token\x18\a \x01(\tR\tpageToken\"\x9f\x01\n" +
+	"\x17SearchDocumentsResponse\x12;\n" +
+	"\aresults\x18\x01 \x03(\v2!.api.proto.search.v1.SearchResultR\aresults\x12\x1f\n" +
+	"\vtotal_count\x18\x02 \x01(\x03R\n" +
+	"totalCount\x12&\n" +
+	"\x0fnext_page_token\x18\x03 \x01(\tR\rnextPageToken\"m\n" +
+	"\x12CreateIndexRequest\x12\x1d\n" +
+	"\n" +
+	"index_name\x18\x01 \x01(\tR\tindexName\x128\n" +
+	"\x06schema\x18\x02 \x01(\v2 .api.proto.search.v1.IndexSchemaR\x06schema\"I\n" +
+	"\x13CreateIndexResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"\x94\x02\n" +
+	"\x06Filter\x12\x14\n" +
+	"\x05field\x18\x01 \x01(\tR\x05field\x12@\n" +
+	"\boperator\x18\x02 \x01(\x0e2$.api.proto.search.v1.Filter.OperatorR\boperator\x12,\n" +
+	"\x05value\x18\x03 \x01(\v2\x16.google.protobuf.ValueR\x05value\"\x83\x01\n" +
+	"\bOperator\x12\x18\n" +
+	"\x14OPERATOR_UNSPECIFIED\x10\x00\x12\x12\n" +
+	"\x0eOPERATOR_EQUAL\x10\x01\x12\x16\n" +
+	"\x12OPERATOR_NOT_EQUAL\x10\x02\x12\x19\n" +
+	"\x15OPERATOR_GREATER_THAN\x10\x03\x12\x16\n" +
+	"\x12OPERATOR_LESS_THAN\x10\x04\"\x96\x01\n" +
+	"\x06SortBy\x12\x14\n" +
+	"\x05field\x18\x01 \x01(\tR\x05field\x127\n" +
+	"\x05order\x18\x02 \x01(\x0e2!.api.proto.search.v1.SortBy.OrderR\x05order\"=\n" +
+	"\x05Order\x12\x15\n" +
+	"\x11ORDER_UNSPECIFIED\x10\x00\x12\r\n" +
+	"\tORDER_ASC\x10\x01\x12\x0e\n" +
+	"\n" +
+	"ORDER_DESC\x10\x02\"v\n" +
+	"\fSearchResult\x12\x1f\n" +
+	"\vdocument_id\x18\x01 \x01(\tR\n" +
+	"documentId\x12\x14\n" +
+	"\x05score\x18\x02 \x01(\x02R\x05score\x12/\n" +
+	"\x06fields\x18\x03 \x01(\v2\x17.google.protobuf.StructR\x06fields\"\x93\x01\n" +
+	"\vIndexSchema\x12<\n" +
+	"\x06fields\x18\x01 \x03(\v2$.api.proto.search.v1.FieldDefinitionR\x06fields\x12F\n" +
+	"\rvector_config\x18\x02 \x01(\v2!.api.proto.search.v1.VectorConfigR\fvectorConfig\"\x9b\x02\n" +
+	"\x0fFieldDefinition\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12B\n" +
+	"\x04type\x18\x02 \x01(\x0e2..api.proto.search.v1.FieldDefinition.FieldTypeR\x04type\"\xaf\x01\n" +
+	"\tFieldType\x12\x1a\n" +
+	"\x16FIELD_TYPE_UNSPECIFIED\x10\x00\x12\x13\n" +
+	"\x0fFIELD_TYPE_TEXT\x10\x01\x12\x16\n" +
+	"\x12FIELD_TYPE_KEYWORD\x10\x02\x12\x16\n" +
+	"\x12FIELD_TYPE_INTEGER\x10\x03\x12\x14\n" +
+	"\x10FIELD_TYPE_FLOAT\x10\x04\x12\x16\n" +
+	"\x12FIELD_TYPE_BOOLEAN\x10\x05\x12\x13\n" +
+	"\x0fFIELD_TYPE_DATE\x10\x06\"\xde\x01\n" +
+	"\fVectorConfig\x12\x1c\n" +
+	"\tdimension\x18\x01 \x01(\x05R\tdimension\x12F\n" +
+	"\bdistance\x18\x02 \x01(\x0e2*.api.proto.search.v1.VectorConfig.DistanceR\bdistance\"h\n" +
+	"\bDistance\x12\x18\n" +
+	"\x14DISTANCE_UNSPECIFIED\x10\x00\x12\x13\n" +
+	"\x0fDISTANCE_COSINE\x10\x01\x12\x13\n" +
+	"\x0fDISTANCE_EUCLID\x10\x02\x12\x18\n" +
+	"\x14DISTANCE_DOT_PRODUCT\x10\x032\xa4\x02\n" +
+	"\rSearchService\x12\x98\x01\n" +
+	"\x0fSearchDocuments\x12+.api.proto.search.v1.SearchDocumentsRequest\x1a,.api.proto.search.v1.SearchDocumentsResponse\"*\x82\xd3\xe4\x93\x02$:\x01*\"\x1f/v1/indexes/{index_name}/search\x12x\n" +
+	"\vCreateIndex\x12'.api.proto.search.v1.CreateIndexRequest\x1a(.api.proto.search.v1.CreateIndexResponse\"\x16\x82\xd3\xe4\x93\x02\x10:\x01*\"\v/v1/indexesB=Z;github.com/takumi-1234/searchService/gen/search/v1;searchv1b\x06proto3"
+
+var (
+	file_proto_search_v1_search_proto_rawDescOnce sync.Once
+	file_proto_search_v1_search_proto_rawDescData []byte
+)
+
+func file_proto_search_v1_search_proto_rawDescGZIP() []byte {
+	file_proto_search_v1_search_proto_rawDescOnce.Do(func() {
+		file_proto_search_v1_search_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_proto_search_v1_search_proto_rawDesc), len(file_proto_search_v1_search_proto_rawDesc)))
+	})
+	return file_proto_search_v1_search_proto_rawDescData
+}
+
+var file_proto_search_v1_search_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_proto_search_v1_search_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_proto_search_v1_search_proto_goTypes = []any{
+	(Filter_Operator)(0),            // 0: api.proto.search.v1.Filter.Operator
+	(SortBy_Order)(0),               // 1: api.proto.search.v1.SortBy.Order
+	(FieldDefinition_FieldType)(0),  // 2: api.proto.search.v1.FieldDefinition.FieldType
+	(VectorConfig_Distance)(0),      // 3: api.proto.search.v1.VectorConfig.Distance
+	(*SearchDocumentsRequest)(nil),  // 4: api.proto.search.v1.SearchDocumentsRequest
+	(*SearchDocumentsResponse)(nil), // 5: api.proto.search.v1.SearchDocumentsResponse
+	(*CreateIndexRequest)(nil),      // 6: api.proto.search.v1.CreateIndexRequest
+	(*CreateIndexResponse)(nil),     // 7: api.proto.search.v1.CreateIndexResponse
+	(*Filter)(nil),                  // 8: api.proto.search.v1.Filter
+	(*SortBy)(nil),                  // 9: api.proto.search.v1.SortBy
+	(*SearchResult)(nil),            // 10: api.proto.search.v1.SearchResult
+	(*IndexSchema)(nil),             // 11: api.proto.search.v1.IndexSchema
+	(*FieldDefinition)(nil),         // 12: api.proto.search.v1.FieldDefinition
+	(*VectorConfig)(nil),            // 13: api.proto.search.v1.VectorConfig
+	(*structpb.Value)(nil),          // 14: google.protobuf.Value
+	(*structpb.Struct)(nil),         // 15: google.protobuf.Struct
+}
+var file_proto_search_v1_search_proto_depIdxs = []int32{
+	8,  // 0: api.proto.search.v1.SearchDocumentsRequest.filters:type_name -> api.proto.search.v1.Filter
+	9,  // 1: api.proto.search.v1.SearchDocumentsRequest.sort_by:type_name -> api.proto.search.v1.SortBy
+	10, // 2: api.proto.search.v1.SearchDocumentsResponse.results:type_name -> api.proto.search.v1.SearchResult
+	11, // 3: api.proto.search.v1.CreateIndexRequest.schema:type_name -> api.proto.search.v1.IndexSchema
+	0,  // 4: api.proto.search.v1.Filter.operator:type_name -> api.proto.search.v1.Filter.Operator
+	14, // 5: api.proto.search.v1.Filter.value:type_name -> google.protobuf.Value
+	1,  // 6: api.proto.search.v1.SortBy.order:type_name -> api.proto.search.v1.SortBy.Order
+	15, // 7: api.proto.search.v1.SearchResult.fields:type_name -> google.protobuf.Struct
+	12, // 8: api.proto.search.v1.IndexSchema.fields:type_name -> api.proto.search.v1.FieldDefinition
+	13, // 9: api.proto.search.v1.IndexSchema.vector_config:type_name -> api.proto.search.v1.VectorConfig
+	2,  // 10: api.proto.search.v1.FieldDefinition.type:type_name -> api.proto.search.v1.FieldDefinition.FieldType
+	3,  // 11: api.proto.search.v1.VectorConfig.distance:type_name -> api.proto.search.v1.VectorConfig.Distance
+	4,  // 12: api.proto.search.v1.SearchService.SearchDocuments:input_type -> api.proto.search.v1.SearchDocumentsRequest
+	6,  // 13: api.proto.search.v1.SearchService.CreateIndex:input_type -> api.proto.search.v1.CreateIndexRequest
+	5,  // 14: api.proto.search.v1.SearchService.SearchDocuments:output_type -> api.proto.search.v1.SearchDocumentsResponse
+	7,  // 15: api.proto.search.v1.SearchService.CreateIndex:output_type -> api.proto.search.v1.CreateIndexResponse
+	14, // [14:16] is the sub-list for method output_type
+	12, // [12:14] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
+}
+
+func init() { file_proto_search_v1_search_proto_init() }
+func file_proto_search_v1_search_proto_init() {
+	if File_proto_search_v1_search_proto != nil {
+		return
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_search_v1_search_proto_rawDesc), len(file_proto_search_v1_search_proto_rawDesc)),
+			NumEnums:      4,
+			NumMessages:   10,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_proto_search_v1_search_proto_goTypes,
+		DependencyIndexes: file_proto_search_v1_search_proto_depIdxs,
+		EnumInfos:         file_proto_search_v1_search_proto_enumTypes,
+		MessageInfos:      file_proto_search_v1_search_proto_msgTypes,
+	}.Build()
+	File_proto_search_v1_search_proto = out.File
+	file_proto_search_v1_search_proto_goTypes = nil
+	file_proto_search_v1_search_proto_depIdxs = nil
+}
+```
+---
+```go 
+# gen/proto/search/v1/search_grpc.pb.go
+
+// Code generated by protoc-gen-go-grpc. DO NOT EDIT.
+// versions:
+// - protoc-gen-go-grpc v1.5.1
+// - protoc             (unknown)
+// source: proto/search/v1/search.proto
+
+package searchv1
+
+import (
+	context "context"
+	grpc "google.golang.org/grpc"
+	codes "google.golang.org/grpc/codes"
+	status "google.golang.org/grpc/status"
+)
+
+// This is a compile-time assertion to ensure that this generated file
+// is compatible with the grpc package it is being compiled against.
+// Requires gRPC-Go v1.64.0 or later.
+const _ = grpc.SupportPackageIsVersion9
+
+const (
+	SearchService_SearchDocuments_FullMethodName = "/api.proto.search.v1.SearchService/SearchDocuments"
+	SearchService_CreateIndex_FullMethodName     = "/api.proto.search.v1.SearchService/CreateIndex"
+)
+
+// SearchServiceClient is the client API for SearchService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// SearchServiceは、ドキュメントの検索とインデックス管理機能を提供します。
+type SearchServiceClient interface {
+	// SearchDocumentsは、指定されたインデックス内でドキュメントを検索します。
+	SearchDocuments(ctx context.Context, in *SearchDocumentsRequest, opts ...grpc.CallOption) (*SearchDocumentsResponse, error)
+	// CreateIndexは、新しい検索インデックスを作成します。（管理者向け）
+	CreateIndex(ctx context.Context, in *CreateIndexRequest, opts ...grpc.CallOption) (*CreateIndexResponse, error)
+}
+
+type searchServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewSearchServiceClient(cc grpc.ClientConnInterface) SearchServiceClient {
+	return &searchServiceClient{cc}
+}
+
+func (c *searchServiceClient) SearchDocuments(ctx context.Context, in *SearchDocumentsRequest, opts ...grpc.CallOption) (*SearchDocumentsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SearchDocumentsResponse)
+	err := c.cc.Invoke(ctx, SearchService_SearchDocuments_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *searchServiceClient) CreateIndex(ctx context.Context, in *CreateIndexRequest, opts ...grpc.CallOption) (*CreateIndexResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateIndexResponse)
+	err := c.cc.Invoke(ctx, SearchService_CreateIndex_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SearchServiceServer is the server API for SearchService service.
+// All implementations should embed UnimplementedSearchServiceServer
+// for forward compatibility.
+//
+// SearchServiceは、ドキュメントの検索とインデックス管理機能を提供します。
+type SearchServiceServer interface {
+	// SearchDocumentsは、指定されたインデックス内でドキュメントを検索します。
+	SearchDocuments(context.Context, *SearchDocumentsRequest) (*SearchDocumentsResponse, error)
+	// CreateIndexは、新しい検索インデックスを作成します。（管理者向け）
+	CreateIndex(context.Context, *CreateIndexRequest) (*CreateIndexResponse, error)
+}
+
+// UnimplementedSearchServiceServer should be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedSearchServiceServer struct{}
+
+func (UnimplementedSearchServiceServer) SearchDocuments(context.Context, *SearchDocumentsRequest) (*SearchDocumentsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SearchDocuments not implemented")
+}
+func (UnimplementedSearchServiceServer) CreateIndex(context.Context, *CreateIndexRequest) (*CreateIndexResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateIndex not implemented")
+}
+func (UnimplementedSearchServiceServer) testEmbeddedByValue() {}
+
+// UnsafeSearchServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to SearchServiceServer will
+// result in compilation errors.
+type UnsafeSearchServiceServer interface {
+	mustEmbedUnimplementedSearchServiceServer()
+}
+
+func RegisterSearchServiceServer(s grpc.ServiceRegistrar, srv SearchServiceServer) {
+	// If the following call pancis, it indicates UnimplementedSearchServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&SearchService_ServiceDesc, srv)
+}
+
+func _SearchService_SearchDocuments_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SearchDocumentsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SearchServiceServer).SearchDocuments(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SearchService_SearchDocuments_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SearchServiceServer).SearchDocuments(ctx, req.(*SearchDocumentsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SearchService_CreateIndex_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateIndexRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SearchServiceServer).CreateIndex(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SearchService_CreateIndex_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SearchServiceServer).CreateIndex(ctx, req.(*CreateIndexRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// SearchService_ServiceDesc is the grpc.ServiceDesc for SearchService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var SearchService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "api.proto.search.v1.SearchService",
+	HandlerType: (*SearchServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "SearchDocuments",
+			Handler:    _SearchService_SearchDocuments_Handler,
+		},
+		{
+			MethodName: "CreateIndex",
+			Handler:    _SearchService_CreateIndex_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "proto/search/v1/search.proto",
+}
+```
+---
+```go 
+# internal/adapter/grpc/server.go
+
+package grpc
+
+import (
+	"context"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
+
+	"go.uber.org/zap"
+
+	searchv1 "github.com/takumi-1234/searchService/gen/proto/search/v1"
+	"github.com/takumi-1234/searchService/internal/port"
+)
+
+// Server は gRPC サーバーの実装です。
+type Server struct {
+	searchv1.UnimplementedSearchServiceServer
+	svc    port.SearchService
+	logger *zap.Logger
+}
+
+// NewServer は新しい Server インスタンスを生成します。
+func NewServer(svc port.SearchService, logger *zap.Logger) *Server {
+	return &Server{
+		svc:    svc,
+		logger: logger,
+	}
+}
+
+// SearchDocuments はドキュメント検索のgRPCリクエストを処理します。
+func (s *Server) SearchDocuments(ctx context.Context, req *searchv1.SearchDocumentsRequest) (*searchv1.SearchDocumentsResponse, error) {
+	if req.GetIndexName() == "" {
+		s.logger.Warn("index_name is empty")
+		return nil, status.Error(codes.InvalidArgument, "index_name is a required field")
+	}
+
+	params := port.SearchParams{
+		IndexName: req.GetIndexName(),
+		QueryText: req.GetQueryText(),
+	}
+
+	searchResult, err := s.svc.Search(ctx, params)
+	if err != nil {
+		s.logger.Error("error from search service", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to search documents")
+	}
+
+	// port.SearchResult を gRPC レスポンスに変換
+	results := make([]*searchv1.SearchResult, len(searchResult.Documents))
+	for i, doc := range searchResult.Documents {
+		fields, err := structpb.NewStruct(doc.Fields)
+		if err != nil {
+			s.logger.Error("failed to convert fields to protobuf struct", zap.Error(err))
+			return nil, status.Error(codes.Internal, "failed to process document fields")
+		}
+		results[i] = &searchv1.SearchResult{
+			DocumentId: doc.ID,
+			Score:      doc.Score,
+			Fields:     fields,
+		}
+	}
+
+	return &searchv1.SearchDocumentsResponse{
+		Results:    results,
+		TotalCount: searchResult.TotalCount,
+	}, nil
+}
+```
+---
+```go 
+# internal/adapter/grpc/server_test.go
+
+package grpc
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	searchv1 "github.com/takumi-1234/searchService/gen/proto/search/v1"
+	"github.com/takumi-1234/searchService/internal/port"
+)
+
+// MockSearchService は port.SearchService のモックです。
+type MockSearchService struct {
+	mock.Mock
+}
+
+func (m *MockSearchService) Search(ctx context.Context, params port.SearchParams) (*port.SearchResult, error) {
+	args := m.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*port.SearchResult), args.Error(1)
+}
+
+func TestServer_SearchDocuments(t *testing.T) {
+	logger := zap.NewNop()
+	ctx := context.Background()
+
+	t.Run("正常系: 検索が成功する", func(t *testing.T) {
+		mockSvc := new(MockSearchService)
+		server := NewServer(mockSvc, logger)
+
+		req := &searchv1.SearchDocumentsRequest{
+			IndexName: "test-index",
+			QueryText: "test query",
+		}
+		params := port.SearchParams{
+			IndexName: req.GetIndexName(),
+			QueryText: req.GetQueryText(),
+		}
+		serviceResult := &port.SearchResult{
+			TotalCount: 1,
+			Documents: []port.Document{
+				{ID: "doc-1", Score: 0.9, Fields: map[string]interface{}{"title": "Result Title"}},
+			},
+		}
+
+		mockSvc.On("Search", ctx, params).Return(serviceResult, nil).Once()
+
+		res, err := server.SearchDocuments(ctx, req)
+
+		assert.NoError(t, err)
+		assert.NotNil(t, res)
+		assert.Equal(t, int64(1), res.TotalCount)
+		assert.Equal(t, "doc-1", res.Results[0].DocumentId)
+		title, _ := res.Results[0].Fields.AsMap()["title"].(string)
+		assert.Equal(t, "Result Title", title)
+
+		mockSvc.AssertExpectations(t)
+	})
+
+	t.Run("エラー系: index_name が空", func(t *testing.T) {
+		server := NewServer(nil, logger)
+		req := &searchv1.SearchDocumentsRequest{IndexName: ""}
+
+		res, err := server.SearchDocuments(ctx, req)
+
+		assert.Error(t, err)
+		assert.Nil(t, res)
+		st, ok := status.FromError(err)
+		assert.True(t, ok)
+		assert.Equal(t, codes.InvalidArgument, st.Code())
+	})
+
+	t.Run("エラー系: サービス層がエラーを返す", func(t *testing.T) {
+		mockSvc := new(MockSearchService)
+		server := NewServer(mockSvc, logger)
+
+		req := &searchv1.SearchDocumentsRequest{
+			IndexName: "test-index",
+			QueryText: "error query",
+		}
+		params := port.SearchParams{
+			IndexName: req.GetIndexName(),
+			QueryText: req.GetQueryText(),
+		}
+		expectedErr := errors.New("service error")
+
+		mockSvc.On("Search", ctx, params).Return(nil, expectedErr).Once()
+
+		res, err := server.SearchDocuments(ctx, req)
+
+		assert.Error(t, err)
+		assert.Nil(t, res)
+		st, ok := status.FromError(err)
+		assert.True(t, ok)
+		assert.Equal(t, codes.Internal, st.Code())
+
+		mockSvc.AssertExpectations(t)
+	})
+}
+```
+---
+```go 
+# internal/adapter/message/consumer.go
+
+package message
+
+// このファイルはelasticsearchリポジトリの実装用です。
+// PoCの段階ではまだ実装しません。
+```
+---
+```go 
+# internal/config/config.go
+
+package config
+
+// このファイルはelasticsearchリポジトリの実装用です。
+// PoCの段階ではまだ実装しません。
+```
+---
+```go 
+# internal/port/repository.go
+
+package port
+
+import "context"
+
+// Documentは検索結果のドキュメントを表します。
+type Document struct {
+	ID     string
+	Score  float32
+	Fields map[string]interface{}
+}
+
+// SearchRepositoryはデータストアへのアクセスを抽象化します。
+type SearchRepository interface {
+	KeywordSearch(ctx context.Context, indexName, query string) ([]Document, error)
+}
+```
+---
+```go 
+# internal/port/service.go
+
+package port
+
+import "context"
+
+// SearchParamsは検索のパラメータです。
+type SearchParams struct {
+	IndexName string
+	QueryText string
+}
+
+// SearchResultはビジネスロジックの検索結果です。
+type SearchResult struct {
+	TotalCount int64
+	Documents  []Document
+}
+
+// SearchServiceはビジネスロジックのインターフェースです。
+type SearchService interface {
+	Search(ctx context.Context, params SearchParams) (*SearchResult, error)
+}
+```
+---
+```go 
+# internal/repository/elasticsearch.go
+
+package repository
+
+// このファイルはelasticsearchリポジトリの実装用です。
+// PoCの段階ではまだ実装しません。
+```
+---
+```go 
+# internal/repository/elasticsearch_poc.go
+
+package repository
+
+import (
+	"context"
+
+	"github.com/takumi-1234/searchService/internal/port"
+)
+
+// elasticsearchPocRepository は SearchRepository のPoC向け実装です。
+type elasticsearchPocRepository struct{}
+
+// NewElasticsearchPocRepository は elasticsearchPocRepository の新しいインスタンスを生成します。
+func NewElasticsearchPocRepository() port.SearchRepository {
+	return &elasticsearchPocRepository{}
+}
+
+// KeywordSearch はハードコードされた検索結果を返します。
+func (r *elasticsearchPocRepository) KeywordSearch(ctx context.Context, indexName, query string) ([]port.Document, error) {
+	// PoCのため、常に固定の正常なレスポンスを返す
+	return []port.Document{
+		{
+			ID:    "doc-123",
+			Score: 0.99,
+			Fields: map[string]interface{}{
+				"title": "PoC Document",
+			},
+		},
+	}, nil
+}
+```
+---
+```go 
+# internal/repository/qdrant.go
+
+package repository
+
+// このファイルはqdrantリポジトリの実装用です。
+// PoCの段階ではまだ実装しません。
+```
+---
+```go 
+# internal/service/search_service.go
+
+package service
+
+import (
+	"context"
+
+	"go.uber.org/zap"
+
+	"github.com/takumi-1234/searchService/internal/port"
+)
+
+type searchService struct {
+	repo   port.SearchRepository
+	logger *zap.Logger
+}
+
+// NewSearchService は searchService の新しいインスタンスを生成します。
+func NewSearchService(repo port.SearchRepository, logger *zap.Logger) port.SearchService {
+	return &searchService{
+		repo:   repo,
+		logger: logger,
+	}
+}
+
+// Search はドキュメントを検索するビジネスロジックを実行します。
+func (s *searchService) Search(ctx context.Context, params port.SearchParams) (*port.SearchResult, error) {
+	s.logger.Info("starting search process",
+		zap.String("index_name", params.IndexName),
+		zap.String("query", params.QueryText),
+	)
+
+	documents, err := s.repo.KeywordSearch(ctx, params.IndexName, params.QueryText)
+	if err != nil {
+		s.logger.Error("failed to perform keyword search in repository", zap.Error(err))
+		return nil, err // エラーは適切にラップされるべきだが、ここではそのまま返す
+	}
+
+	result := &port.SearchResult{
+		TotalCount: int64(len(documents)),
+		Documents:  make([]port.Document, len(documents)),
+	}
+
+	// port.Document (repository) を port.Document (service) に変換
+	for i, doc := range documents {
+		result.Documents[i] = port.Document(doc)
+	}
+
+	s.logger.Info("search process finished successfully",
+		zap.Int64("hit_count", result.TotalCount),
+	)
+
+	return result, nil
+}
+```
+---
+```go 
+# internal/service/search_service_test.go
+
+package service
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"go.uber.org/zap"
+
+	"github.com/takumi-1234/searchService/internal/port"
+)
+
+// MockSearchRepository は port.SearchRepository のモックです。
+type MockSearchRepository struct {
+	mock.Mock
+}
+
+func (m *MockSearchRepository) KeywordSearch(ctx context.Context, indexName, query string) ([]port.Document, error) {
+	args := m.Called(ctx, indexName, query)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]port.Document), args.Error(1)
+}
+
+func TestSearchService_Search(t *testing.T) {
+	logger := zap.NewNop()
+	ctx := context.Background()
+
+	t.Run("正常系: 検索が成功する", func(t *testing.T) {
+		mockRepo := new(MockSearchRepository)
+		service := NewSearchService(mockRepo, logger)
+
+		repoDocs := []port.Document{
+			{ID: "doc-1", Score: 0.9, Fields: map[string]interface{}{"title": "Test"}},
+		}
+		params := port.SearchParams{IndexName: "test-index", QueryText: "test query"}
+
+		mockRepo.On("KeywordSearch", ctx, params.IndexName, params.QueryText).Return(repoDocs, nil).Once()
+
+		result, err := service.Search(ctx, params)
+
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.Equal(t, int64(1), result.TotalCount)
+		assert.Equal(t, "doc-1", result.Documents[0].ID)
+		mockRepo.AssertExpectations(t)
+	})
+
+	t.Run("エラー系: リポジトリがエラーを返す", func(t *testing.T) {
+		mockRepo := new(MockSearchRepository)
+		service := NewSearchService(mockRepo, logger)
+
+		expectedErr := errors.New("repository error")
+		params := port.SearchParams{IndexName: "test-index", QueryText: "error query"}
+
+		mockRepo.On("KeywordSearch", ctx, params.IndexName, params.QueryText).Return(nil, expectedErr).Once()
+
+		result, err := service.Search(ctx, params)
+
+		assert.Error(t, err)
+		assert.Nil(t, result)
+		assert.Equal(t, expectedErr, err)
+		mockRepo.AssertExpectations(t)
+	})
+}
+```
+---
+```bash 
+# scripts/setup-dev.sh
+
+```
+---
+```go 
+# tests/e2e/main_test.go
+
+package e2e
+
+// このファイルはelasticsearchリポジトリの実装用です。
+// PoCの段階ではまだ実装しません。
+```
+---
+```go 
+# tests/integration/search_test.go
+
+package integration
+
+// このファイルはelasticsearchリポジトリの実装用です。
+// PoCの段階ではまだ実装しません。
+```
+---

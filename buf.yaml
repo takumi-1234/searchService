@@ -1,0 +1,9 @@
+version: v1beta1
+build:
+  roots:
+    - api
+deps:
+  - buf.build/googleapis/googleapis
+lint:
+  use:
+    - DEFAULT

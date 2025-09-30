@@ -1,0 +1,135 @@
+syntax = "proto3";
+
+package api.proto.search.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/struct.proto";
+
+option go_package = "github.com/takumi-1234/searchService/gen/search/v1;searchv1";
+
+// SearchServiceは、ドキュメントの検索とインデックス管理機能を提供します。
+service SearchService {
+  // SearchDocumentsは、指定されたインデックス内でドキュメントを検索します。
+  rpc SearchDocuments(SearchDocumentsRequest) returns (SearchDocumentsResponse) {
+    option (google.api.http) = {
+      post: "/v1/indexes/{index_name}/search"
+      body: "*"
+    };
+  }
+
+  // CreateIndexは、新しい検索インデックスを作成します。（管理者向け）
+  rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse) {
+    option (google.api.http) = {
+      post: "/v1/indexes"
+      body: "*"
+    };
+  }
+}
+
+// ========== Request / Response Messages ==========
+
+message SearchDocumentsRequest {
+  // 検索対象のインデックス名 (例: "exams")
+  string index_name = 1;
+  // 検索クエリ文字列
+  string query_text = 2;
+  // 検索クエリベクトル
+  repeated float query_vector = 3;
+  // フィルタ条件
+  repeated Filter filters = 4;
+  // ソート条件
+  SortBy sort_by = 5;
+  // 1ページあたりの結果数
+  int32 page_size = 6;
+  // 次ページのトークン
+  string page_token = 7;
+}
+
+message SearchDocumentsResponse {
+  // 検索結果のリスト
+  repeated SearchResult results = 1;
+  // 総ヒット件数
+  int64 total_count = 2;
+  // 次ページのトークン
+  string next_page_token = 3;
+}
+
+message CreateIndexRequest {
+  // 作成するインデックス名
+  string index_name = 1;
+  // インデックスのスキーマ定義
+  IndexSchema schema = 2;
+}
+
+message CreateIndexResponse {
+  // 成功したかどうか
+  bool success = 1;
+  // メッセージ
+  string message = 2;
+}
+
+// ========== Common Data Structures ==========
+
+message Filter {
+  enum Operator {
+    OPERATOR_UNSPECIFIED = 0;
+    OPERATOR_EQUAL = 1;
+    OPERATOR_NOT_EQUAL = 2;
+    OPERATOR_GREATER_THAN = 3;
+    OPERATOR_LESS_THAN = 4;
+  }
+  string field = 1;
+  Operator operator = 2;
+  google.protobuf.Value value = 3;
+}
+
+message SortBy {
+  enum Order {
+    ORDER_UNSPECIFIED = 0;
+    ORDER_ASC = 1;
+    ORDER_DESC = 2;
+  }
+  string field = 1;
+  Order order = 2;
+}
+
+message SearchResult {
+  // ドキュメントID
+  string document_id = 1;
+  // 関連度スコア
+  float score = 2;
+  // ドキュメントのフィールド内容
+  google.protobuf.Struct fields = 3;
+}
+
+message IndexSchema {
+  // フィールド定義
+  repeated FieldDefinition fields = 1;
+  // ベクトル設定
+  VectorConfig vector_config = 2;
+}
+
+message FieldDefinition {
+  enum FieldType {
+    FIELD_TYPE_UNSPECIFIED = 0;
+    FIELD_TYPE_TEXT = 1;
+    FIELD_TYPE_KEYWORD = 2;
+    FIELD_TYPE_INTEGER = 3;
+    FIELD_TYPE_FLOAT = 4;
+    FIELD_TYPE_BOOLEAN = 5;
+    FIELD_TYPE_DATE = 6;
+  }
+  string name = 1;
+  FieldType type = 2;
+}
+
+message VectorConfig {
+  enum Distance {
+    DISTANCE_UNSPECIFIED = 0;
+    DISTANCE_COSINE = 1;
+    DISTANCE_EUCLID = 2;
+    DISTANCE_DOT_PRODUCT = 3;
+  }
+  int32 dimension = 1;
+  Distance distance = 2;
+}

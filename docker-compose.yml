@@ -1,0 +1,13 @@
+services:
+  search-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "50051:50051"
+    networks:
+      - search_net
+
+networks:
+  search_net:
+    driver: bridge
