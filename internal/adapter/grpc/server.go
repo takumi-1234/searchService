@@ -2,6 +2,8 @@ package grpc
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -74,4 +76,112 @@ func (s *Server) SearchDocuments(ctx context.Context, req *searchv1.SearchDocume
 		Results:    results,
 		TotalCount: searchResult.TotalCount,
 	}, nil
+}
+
+// CreateIndex は CreateIndex RPC を処理します。
+func (s *Server) CreateIndex(ctx context.Context, req *searchv1.CreateIndexRequest) (*searchv1.CreateIndexResponse, error) {
+	if req.GetIndexName() == "" {
+		s.logger.Warn("index_name is empty")
+		return nil, status.Error(codes.InvalidArgument, "index_name is a required field")
+	}
+
+	params, err := buildCreateIndexParams(req)
+	if err != nil {
+		s.logger.Warn("invalid create index request", zap.Error(err))
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	if err := s.svc.CreateIndex(ctx, params); err != nil {
+		s.logger.Error("failed to create index", zap.String("index_name", params.IndexName), zap.Error(err))
+		return nil, status.Error(grpcCodeForCreateIndexError(err), "failed to create index")
+	}
+
+	return &searchv1.CreateIndexResponse{
+		Success: true,
+		Message: fmt.Sprintf("index %s created", params.IndexName),
+	}, nil
+}
+
+func buildCreateIndexParams(req *searchv1.CreateIndexRequest) (port.CreateIndexParams, error) {
+	schema := req.GetSchema()
+	if schema == nil {
+		return port.CreateIndexParams{}, fmt.Errorf("schema is required")
+	}
+
+	fields := make([]port.FieldDefinition, 0, len(schema.GetFields()))
+	for _, field := range schema.GetFields() {
+		if field.GetName() == "" {
+			return port.CreateIndexParams{}, fmt.Errorf("field name is required")
+		}
+		fieldType, err := convertProtoFieldType(field.GetType())
+		if err != nil {
+			return port.CreateIndexParams{}, err
+		}
+		fields = append(fields, port.FieldDefinition{
+			Name: field.GetName(),
+			Type: fieldType,
+		})
+	}
+
+	vectorCfg := schema.GetVectorConfig()
+	if vectorCfg == nil {
+		return port.CreateIndexParams{}, fmt.Errorf("vector_config is required")
+	}
+	if vectorCfg.GetDimension() <= 0 {
+		return port.CreateIndexParams{}, fmt.Errorf("vector dimension must be positive")
+	}
+
+	distance, err := convertProtoVectorDistance(vectorCfg.GetDistance())
+	if err != nil {
+		return port.CreateIndexParams{}, err
+	}
+
+	return port.CreateIndexParams{
+		IndexName: req.GetIndexName(),
+		Fields:    fields,
+		VectorConfig: &port.VectorConfig{
+			Dimension: int(vectorCfg.GetDimension()),
+			Distance:  distance,
+		},
+	}, nil
+}
+
+func convertProtoFieldType(fieldType searchv1.FieldDefinition_FieldType) (string, error) {
+	switch fieldType {
+	case searchv1.FieldDefinition_FIELD_TYPE_TEXT:
+		return port.FieldTypeText, nil
+	case searchv1.FieldDefinition_FIELD_TYPE_KEYWORD:
+		return port.FieldTypeKeyword, nil
+	case searchv1.FieldDefinition_FIELD_TYPE_INTEGER:
+		return port.FieldTypeInteger, nil
+	case searchv1.FieldDefinition_FIELD_TYPE_FLOAT:
+		return port.FieldTypeFloat, nil
+	case searchv1.FieldDefinition_FIELD_TYPE_BOOLEAN:
+		return port.FieldTypeBoolean, nil
+	case searchv1.FieldDefinition_FIELD_TYPE_DATE:
+		return port.FieldTypeDate, nil
+	default:
+		return "", fmt.Errorf("unsupported field type: %s", fieldType.String())
+	}
+}
+
+func convertProtoVectorDistance(distance searchv1.VectorConfig_Distance) (port.VectorDistance, error) {
+	switch distance {
+	case searchv1.VectorConfig_DISTANCE_COSINE:
+		return port.VectorDistanceCosine, nil
+	case searchv1.VectorConfig_DISTANCE_EUCLID:
+		return port.VectorDistanceEuclid, nil
+	case searchv1.VectorConfig_DISTANCE_DOT_PRODUCT:
+		return port.VectorDistanceDot, nil
+	default:
+		return "", fmt.Errorf("unsupported vector distance: %s", distance.String())
+	}
+}
+
+func grpcCodeForCreateIndexError(err error) codes.Code {
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "already exists") {
+		return codes.AlreadyExists
+	}
+	return codes.Internal
 }

@@ -251,6 +251,69 @@ func startTestGRPCServer(t *testing.T, esClient *elasticsearch.TypedClient, qdra
 	return lis.Addr().String(), func() { server.GracefulStop() }
 }
 
+func TestCreateIndex_Integration(t *testing.T) {
+	ctx := context.Background()
+
+	esClient, esCleanup, err := setupElasticsearch(ctx)
+	require.NoError(t, err, "failed to setup elasticsearch")
+	defer esCleanup()
+
+	qdrantConn, qdrantCleanup, err := setupQdrant(ctx)
+	require.NoError(t, err, "failed to setup qdrant")
+	defer qdrantCleanup()
+
+	grpcAddr, grpcCleanup := startTestGRPCServer(t, esClient, qdrantConn)
+	defer grpcCleanup()
+
+	conn, err := grpc.NewClient(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	defer conn.Close()
+	client := searchv1.NewSearchServiceClient(conn)
+
+	indexName := fmt.Sprintf("create-index-test-%d", time.Now().UnixNano())
+	req := &searchv1.CreateIndexRequest{
+		IndexName: indexName,
+		Schema: &searchv1.IndexSchema{
+			Fields: []*searchv1.FieldDefinition{
+				{Name: "content", Type: searchv1.FieldDefinition_FIELD_TYPE_TEXT},
+				{Name: "category", Type: searchv1.FieldDefinition_FIELD_TYPE_KEYWORD},
+			},
+			VectorConfig: &searchv1.VectorConfig{
+				Dimension: 3,
+				Distance:  searchv1.VectorConfig_DISTANCE_COSINE,
+			},
+		},
+	}
+
+	res, err := client.CreateIndex(ctx, req)
+	require.NoError(t, err, "CreateIndex RPC failed")
+	require.NotNil(t, res)
+	assert.True(t, res.GetSuccess())
+
+	exists, err := esClient.Indices.Exists(indexName).Do(ctx)
+	require.NoError(t, err, "failed to check elasticsearch index existence")
+	assert.True(t, exists, "elasticsearch index should exist after CreateIndex")
+
+	collectionsClient := qdrant.NewCollectionsClient(qdrantConn)
+	info, err := collectionsClient.Get(ctx, &qdrant.GetCollectionInfoRequest{CollectionName: indexName})
+	require.NoError(t, err, "failed to get qdrant collection info")
+	require.NotNil(t, info.GetResult())
+
+	collectionConfig := info.GetResult().GetConfig()
+	require.NotNil(t, collectionConfig, "collection config must not be nil")
+
+	params := collectionConfig.GetParams()
+	require.NotNil(t, params, "collection params must not be nil")
+
+	vectorsConfig := params.GetVectorsConfig()
+	require.NotNil(t, vectorsConfig, "vectors config must not be nil")
+
+	vectorParams := vectorsConfig.GetParams()
+	require.NotNil(t, vectorParams, "vector params must not be nil")
+	assert.EqualValues(t, 3, vectorParams.GetSize())
+	assert.Equal(t, qdrant.Distance_Cosine, vectorParams.GetDistance())
+}
+
 // TestSearchDocuments_HybridSearch_Integration はハイブリッド検索の統合テストです。
 func TestSearchDocuments_HybridSearch_Integration(t *testing.T) {
 	ctx := context.Background()

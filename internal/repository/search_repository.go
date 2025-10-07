@@ -1,11 +1,13 @@
 package repository
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"reflect"
+	"strings"
 
 	"github.com/elastic/go-elasticsearch/v9"
 	"github.com/elastic/go-elasticsearch/v9/typedapi/core/search"
@@ -22,15 +24,17 @@ import (
 
 // searchRepository は Elasticsearch と Qdrant の両方との通信を担当します。
 type searchRepository struct {
-	esClient     *elasticsearch.TypedClient
-	qdrantClient qdrant.PointsClient
+	esClient          *elasticsearch.TypedClient
+	qdrantPoints      qdrant.PointsClient
+	qdrantCollections qdrant.CollectionsClient
 }
 
 // NewSearchRepository は新しい統合 searchRepository のインスタンスを生成します。
 func NewSearchRepository(es *elasticsearch.TypedClient, qdrantConn *grpc.ClientConn) port.SearchRepository {
 	return &searchRepository{
-		esClient:     es,
-		qdrantClient: qdrant.NewPointsClient(qdrantConn),
+		esClient:          es,
+		qdrantPoints:      qdrant.NewPointsClient(qdrantConn),
+		qdrantCollections: qdrant.NewCollectionsClient(qdrantConn),
 	}
 }
 
@@ -83,7 +87,7 @@ func (r *searchRepository) VectorSearch(ctx context.Context, indexName string, v
 		},
 	}
 
-	res, err := r.qdrantClient.Search(ctx, req)
+	res, err := r.qdrantPoints.Search(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("qdrant search request failed: %w", err)
 	}
@@ -139,7 +143,7 @@ func (r *searchRepository) IndexDocument(ctx context.Context, params port.IndexD
 			}
 
 			wait := true
-			_, err = r.qdrantClient.Upsert(gCtx, &qdrant.UpsertPoints{
+			_, err = r.qdrantPoints.Upsert(gCtx, &qdrant.UpsertPoints{
 				CollectionName: params.IndexName,
 				Wait:           &wait,
 				Points: []*qdrant.PointStruct{
@@ -181,7 +185,7 @@ func (r *searchRepository) DeleteDocument(ctx context.Context, indexName, docume
 	g.Go(func() error {
 		wait := true
 		// 修正点: メソッド名を Delete に変更
-		_, err := r.qdrantClient.Delete(gCtx, &qdrant.DeletePoints{
+		_, err := r.qdrantPoints.Delete(gCtx, &qdrant.DeletePoints{
 			CollectionName: indexName,
 			Wait:           &wait,
 			Points: &qdrant.PointsSelector{
@@ -204,6 +208,122 @@ func (r *searchRepository) DeleteDocument(ctx context.Context, indexName, docume
 	})
 
 	return g.Wait()
+}
+
+// CreateIndex は Elasticsearch と Qdrant にインデックスを作成します。
+func (r *searchRepository) CreateIndex(ctx context.Context, params port.CreateIndexParams) error {
+	if params.IndexName == "" {
+		return fmt.Errorf("index name must not be empty")
+	}
+	if params.VectorConfig == nil {
+		return fmt.Errorf("vector config must not be nil")
+	}
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		return r.createElasticsearchIndex(gCtx, params)
+	})
+
+	g.Go(func() error {
+		return r.createQdrantCollection(gCtx, params)
+	})
+
+	return g.Wait()
+}
+
+func (r *searchRepository) createElasticsearchIndex(ctx context.Context, params port.CreateIndexParams) error {
+	properties := make(map[string]interface{}, len(params.Fields))
+	for _, field := range params.Fields {
+		fieldType, err := toElasticsearchFieldType(field.Type)
+		if err != nil {
+			return err
+		}
+		properties[field.Name] = map[string]interface{}{"type": fieldType}
+	}
+
+	createReq := r.esClient.Indices.Create(params.IndexName)
+	if len(properties) > 0 {
+		body := map[string]interface{}{
+			"mappings": map[string]interface{}{
+				"properties": properties,
+			},
+		}
+		payload, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("failed to marshal elasticsearch mappings: %w", err)
+		}
+		createReq = createReq.Raw(bytes.NewReader(payload))
+	}
+
+	res, err := createReq.Do(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create elasticsearch index: %w", err)
+	}
+	if !res.Acknowledged {
+		return fmt.Errorf("elasticsearch index creation not acknowledged")
+	}
+	return nil
+}
+
+func (r *searchRepository) createQdrantCollection(ctx context.Context, params port.CreateIndexParams) error {
+	vectorCfg := params.VectorConfig
+	if vectorCfg.Dimension <= 0 {
+		return fmt.Errorf("vector dimension must be positive")
+	}
+
+	distance, err := toQdrantDistance(vectorCfg.Distance)
+	if err != nil {
+		return err
+	}
+
+	_, err = r.qdrantCollections.Create(ctx, &qdrant.CreateCollection{
+		CollectionName: params.IndexName,
+		VectorsConfig: &qdrant.VectorsConfig{
+			Config: &qdrant.VectorsConfig_Params{
+				Params: &qdrant.VectorParams{
+					Size:     uint64(vectorCfg.Dimension),
+					Distance: distance,
+				},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create qdrant collection: %w", err)
+	}
+	return nil
+}
+
+func toElasticsearchFieldType(fieldType string) (string, error) {
+	switch normalized := strings.ToLower(fieldType); normalized {
+	case port.FieldTypeText:
+		return "text", nil
+	case port.FieldTypeKeyword:
+		return "keyword", nil
+	case port.FieldTypeInteger:
+		return "integer", nil
+	case port.FieldTypeFloat:
+		return "float", nil
+	case port.FieldTypeBoolean:
+		return "boolean", nil
+	case port.FieldTypeDate:
+		return "date", nil
+	default:
+		return "", fmt.Errorf("unsupported field type: %s", fieldType)
+	}
+}
+
+func toQdrantDistance(distance port.VectorDistance) (qdrant.Distance, error) {
+	switch distance {
+	case port.VectorDistanceCosine:
+		return qdrant.Distance_Cosine, nil
+	case port.VectorDistanceEuclid:
+		return qdrant.Distance_Euclid, nil
+	case port.VectorDistanceDot:
+		return qdrant.Distance_Dot, nil
+	default:
+		return qdrant.Distance_UnknownDistance, fmt.Errorf("unsupported vector distance: %s", distance)
+	}
 }
 
 // ... (valueFromQdrant, payloadToQdrant ヘルパー関数は変更なし)

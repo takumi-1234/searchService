@@ -2,10 +2,12 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"sort"
+	"strings"
 
-	"golang.org/x/sync/errgroup"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/takumi-1234/searchService/internal/port"
 )
@@ -24,7 +26,29 @@ func NewSearchService(repo port.SearchRepository, logger *zap.Logger) port.Searc
 	}
 }
 
-// Search はキーワード検索とベクトル検索を並列に実行し、スコアを加算してマージ、スコア降順で返却する。
+// CreateIndex は新しい検索インデックスを作成します。
+func (s *searchService) CreateIndex(ctx context.Context, params port.CreateIndexParams) error {
+	if err := validateCreateIndexParams(params); err != nil {
+		return err
+	}
+
+	s.logger.Info("creating index",
+		zap.String("index_name", params.IndexName),
+		zap.Int("field_count", len(params.Fields)),
+		zap.Int("vector_dimension", params.VectorConfig.Dimension),
+		zap.String("vector_distance", string(params.VectorConfig.Distance)),
+	)
+
+	if err := s.repo.CreateIndex(ctx, params); err != nil {
+		s.logger.Error("failed to create index", zap.String("index_name", params.IndexName), zap.Error(err))
+		return err
+	}
+
+	s.logger.Info("index created successfully", zap.String("index_name", params.IndexName))
+	return nil
+}
+
+// IndexDocument はドキュメントをインデックスに追加または更新します。
 func (s *searchService) IndexDocument(ctx context.Context, params port.IndexDocumentParams) error {
 	return s.repo.IndexDocument(ctx, params)
 }
@@ -33,6 +57,7 @@ func (s *searchService) DeleteDocument(ctx context.Context, indexName, documentI
 	return s.repo.DeleteDocument(ctx, indexName, documentID)
 }
 
+// Search はキーワード検索とベクトル検索を並列に実行し、スコアを加算してマージ、スコア降順で返却する。
 func (s *searchService) Search(ctx context.Context, params port.SearchParams) (*port.SearchResult, error) {
 	s.logger.Info("starting search process",
 		zap.String("index_name", params.IndexName),
@@ -141,4 +166,57 @@ func (s *searchService) Search(ctx context.Context, params port.SearchParams) (*
 	)
 
 	return result, nil
+}
+
+func validateCreateIndexParams(params port.CreateIndexParams) error {
+	if params.IndexName == "" {
+		return fmt.Errorf("index name is required")
+	}
+	if params.VectorConfig == nil {
+		return fmt.Errorf("vector config is required")
+	}
+	if params.VectorConfig.Dimension <= 0 {
+		return fmt.Errorf("vector dimension must be positive")
+	}
+	if !isValidVectorDistance(params.VectorConfig.Distance) {
+		return fmt.Errorf("unsupported vector distance: %s", params.VectorConfig.Distance)
+	}
+	seen := make(map[string]struct{}, len(params.Fields))
+	for _, field := range params.Fields {
+		if field.Name == "" {
+			return fmt.Errorf("field name is required")
+		}
+		key := strings.ToLower(field.Name)
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("duplicate field name: %s", field.Name)
+		}
+		if !isValidFieldType(field.Type) {
+			return fmt.Errorf("unsupported field type: %s", field.Type)
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+func isValidFieldType(fieldType string) bool {
+	switch strings.ToLower(fieldType) {
+	case port.FieldTypeText,
+		port.FieldTypeKeyword,
+		port.FieldTypeInteger,
+		port.FieldTypeFloat,
+		port.FieldTypeBoolean,
+		port.FieldTypeDate:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidVectorDistance(distance port.VectorDistance) bool {
+	switch distance {
+	case port.VectorDistanceCosine, port.VectorDistanceEuclid, port.VectorDistanceDot:
+		return true
+	default:
+		return false
+	}
 }

@@ -38,6 +38,11 @@ func (m *MockSearchService) DeleteDocument(ctx context.Context, indexName, docum
 	return args.Error(0)
 }
 
+func (m *MockSearchService) CreateIndex(ctx context.Context, params port.CreateIndexParams) error {
+	args := m.Called(ctx, params)
+	return args.Error(0)
+}
+
 func TestServer_SearchDocuments(t *testing.T) {
 	logger := zap.NewNop()
 	ctx := context.Background()
@@ -111,6 +116,112 @@ func TestServer_SearchDocuments(t *testing.T) {
 		st, ok := status.FromError(err)
 		assert.True(t, ok)
 		assert.Equal(t, codes.Internal, st.Code())
+
+		mockSvc.AssertExpectations(t)
+	})
+}
+
+func TestServer_CreateIndex(t *testing.T) {
+	logger := zap.NewNop()
+	ctx := context.Background()
+
+	t.Run("正常系: インデックス作成が成功する", func(t *testing.T) {
+		mockSvc := new(MockSearchService)
+		server := NewServer(mockSvc, logger)
+
+		req := &searchv1.CreateIndexRequest{
+			IndexName: "test-index",
+			Schema: &searchv1.IndexSchema{
+				Fields: []*searchv1.FieldDefinition{
+					{Name: "content", Type: searchv1.FieldDefinition_FIELD_TYPE_TEXT},
+					{Name: "published_at", Type: searchv1.FieldDefinition_FIELD_TYPE_DATE},
+				},
+				VectorConfig: &searchv1.VectorConfig{
+					Dimension: 3,
+					Distance:  searchv1.VectorConfig_DISTANCE_COSINE,
+				},
+			},
+		}
+
+		expectedParams := port.CreateIndexParams{
+			IndexName: "test-index",
+			Fields: []port.FieldDefinition{
+				{Name: "content", Type: port.FieldTypeText},
+				{Name: "published_at", Type: port.FieldTypeDate},
+			},
+			VectorConfig: &port.VectorConfig{
+				Dimension: 3,
+				Distance:  port.VectorDistanceCosine,
+			},
+		}
+
+		mockSvc.On("CreateIndex", ctx, expectedParams).Return(nil).Once()
+
+		res, err := server.CreateIndex(ctx, req)
+
+		assert.NoError(t, err)
+		assert.NotNil(t, res)
+		assert.True(t, res.Success)
+		assert.Contains(t, res.Message, "test-index")
+
+		mockSvc.AssertExpectations(t)
+	})
+
+	t.Run("エラー系: index_name が空", func(t *testing.T) {
+		mockSvc := new(MockSearchService)
+		server := NewServer(mockSvc, logger)
+		req := &searchv1.CreateIndexRequest{IndexName: ""}
+
+		res, err := server.CreateIndex(ctx, req)
+
+		assert.Error(t, err)
+		assert.Nil(t, res)
+		st, ok := status.FromError(err)
+		assert.True(t, ok)
+		assert.Equal(t, codes.InvalidArgument, st.Code())
+
+		mockSvc.AssertNotCalled(t, "CreateIndex", mock.Anything, mock.Anything)
+		mockSvc.AssertExpectations(t)
+	})
+
+	t.Run("エラー系: サービス層がエラーを返す", func(t *testing.T) {
+		mockSvc := new(MockSearchService)
+		server := NewServer(mockSvc, logger)
+
+		req := &searchv1.CreateIndexRequest{
+			IndexName: "existing-index",
+			Schema: &searchv1.IndexSchema{
+				Fields: []*searchv1.FieldDefinition{
+					{Name: "content", Type: searchv1.FieldDefinition_FIELD_TYPE_TEXT},
+				},
+				VectorConfig: &searchv1.VectorConfig{
+					Dimension: 3,
+					Distance:  searchv1.VectorConfig_DISTANCE_COSINE,
+				},
+			},
+		}
+
+		expectedParams := port.CreateIndexParams{
+			IndexName: "existing-index",
+			Fields: []port.FieldDefinition{
+				{Name: "content", Type: port.FieldTypeText},
+			},
+			VectorConfig: &port.VectorConfig{
+				Dimension: 3,
+				Distance:  port.VectorDistanceCosine,
+			},
+		}
+
+		expectedErr := errors.New("index already exists")
+		mockSvc.On("CreateIndex", ctx, expectedParams).Return(expectedErr).Once()
+
+		res, err := server.CreateIndex(ctx, req)
+
+		assert.Error(t, err)
+		assert.Nil(t, res)
+		st, ok := status.FromError(err)
+		assert.True(t, ok)
+		assert.Equal(t, codes.AlreadyExists, st.Code())
 
 		mockSvc.AssertExpectations(t)
 	})

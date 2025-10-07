@@ -43,6 +43,71 @@ func (m *MockSearchRepository) IndexDocument(ctx context.Context, params port.In
 	return args.Error(0)
 }
 
+func (m *MockSearchRepository) CreateIndex(ctx context.Context, params port.CreateIndexParams) error {
+	args := m.Called(ctx, params)
+	return args.Error(0)
+}
+
+func TestSearchService_CreateIndex(t *testing.T) {
+	logger := zap.NewNop()
+	ctx := context.Background()
+
+	validParams := port.CreateIndexParams{
+		IndexName: "test-index",
+		Fields: []port.FieldDefinition{
+			{Name: "content", Type: port.FieldTypeText},
+			{Name: "published_at", Type: port.FieldTypeDate},
+		},
+		VectorConfig: &port.VectorConfig{
+			Dimension: 3,
+			Distance:  port.VectorDistanceCosine,
+		},
+	}
+
+	t.Run("success", func(t *testing.T) {
+		mockRepo := new(MockSearchRepository)
+		service := NewSearchService(mockRepo, logger)
+
+		mockRepo.On("CreateIndex", ctx, validParams).Return(nil).Once()
+
+		err := service.CreateIndex(ctx, validParams)
+		assert.NoError(t, err)
+
+		mockRepo.AssertExpectations(t)
+	})
+
+	t.Run("validation error prevents repository call", func(t *testing.T) {
+		mockRepo := new(MockSearchRepository)
+		service := NewSearchService(mockRepo, logger)
+
+		invalidParams := port.CreateIndexParams{
+			IndexName: "",
+			VectorConfig: &port.VectorConfig{
+				Dimension: 3,
+				Distance:  port.VectorDistanceCosine,
+			},
+		}
+
+		err := service.CreateIndex(ctx, invalidParams)
+		assert.Error(t, err)
+
+		mockRepo.AssertNotCalled(t, "CreateIndex", mock.Anything, mock.Anything)
+	})
+
+	t.Run("repository error is returned", func(t *testing.T) {
+		mockRepo := new(MockSearchRepository)
+		service := NewSearchService(mockRepo, logger)
+
+		expectedErr := errors.New("repo failure")
+		mockRepo.On("CreateIndex", ctx, validParams).Return(expectedErr).Once()
+
+		err := service.CreateIndex(ctx, validParams)
+		assert.ErrorIs(t, err, expectedErr)
+
+		mockRepo.AssertExpectations(t)
+	})
+}
+
 func TestSearchService_Search(t *testing.T) {
 	logger := zap.NewNop()
 	ctx := context.Background()
