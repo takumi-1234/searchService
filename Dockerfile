@@ -1,7 +1,16 @@
-FROM golang:1.24.7-alpine AS builder
+FROM golang:1.23-bullseye AS builder
 
-# ビルドに必要なツールをインストール
-RUN apk add --no-cache git curl
+ENV GOTOOLCHAIN=go1.24.7
+
+# ビルドに必要なツールをインストール（cgo/librdkafka 用のツールチェーンを含む）
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git \
+        curl \
+        build-essential \
+        pkg-config \
+        librdkafka-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # buf CLIをインストール
 RUN curl -sSL "https://github.com/bufbuild/buf/releases/latest/download/buf-Linux-x86_64" -o "/usr/local/bin/buf" && \
@@ -9,11 +18,9 @@ RUN curl -sSL "https://github.com/bufbuild/buf/releases/latest/download/buf-Linu
 
 WORKDIR /app
 
-# go.modとgo.sumを先にコピーして依存関係をキャッシュ
-COPY go.mod ./
-# go mod tidy で go.sum を生成し、依存関係をダウンロード
-RUN go mod tidy
-COPY go.sum ./
+# go.mod と go.sum を先にコピーして依存関係をキャッシュ
+COPY go.mod go.sum ./
+RUN go mod download
 
 # proto定義とbuf設定ファイルをコピー
 COPY buf.yaml buf.gen.yaml ./
@@ -29,12 +36,19 @@ RUN buf generate
 # 残りのソースコードをコピー
 COPY . .
 
-# アプリケーションをビルド
-RUN CGO_ENABLED=0 GOOS=linux go build -o /search-service ./cmd/server
+# アプリケーションをビルド（Kafka クライアントは cgo が必須のため有効化）
+RUN CGO_ENABLED=1 GOOS=linux go build -o /search-service ./cmd/server
 
-FROM alpine:latest
+FROM debian:bullseye-slim
 
 WORKDIR /
+
+# 依存ライブラリをインストール
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        librdkafka1 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /search-service /search-service
 

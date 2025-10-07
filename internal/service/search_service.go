@@ -4,18 +4,19 @@ import (
 	"context"
 	"sort"
 
-	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
+	"go.uber.org/zap"
 
 	"github.com/takumi-1234/searchService/internal/port"
 )
 
+// searchService は SearchRepository に依存する。
 type searchService struct {
 	repo   port.SearchRepository
 	logger *zap.Logger
 }
 
-// NewSearchService は searchService の新しいインスタンスを生成します。
+// NewSearchService は searchService の新しいインスタンスを生成する。
 func NewSearchService(repo port.SearchRepository, logger *zap.Logger) port.SearchService {
 	return &searchService{
 		repo:   repo,
@@ -23,72 +24,109 @@ func NewSearchService(repo port.SearchRepository, logger *zap.Logger) port.Searc
 	}
 }
 
-// Search はハイブリッド検索を実行します。
+// Search はキーワード検索とベクトル検索を並列に実行し、スコアを加算してマージ、スコア降順で返却する。
+func (s *searchService) IndexDocument(ctx context.Context, params port.IndexDocumentParams) error {
+	return s.repo.IndexDocument(ctx, params)
+}
+
+func (s *searchService) DeleteDocument(ctx context.Context, indexName, documentID string) error {
+	return s.repo.DeleteDocument(ctx, indexName, documentID)
+}
+
 func (s *searchService) Search(ctx context.Context, params port.SearchParams) (*port.SearchResult, error) {
-	s.logger.Info("starting hybrid search process",
+	s.logger.Info("starting search process",
 		zap.String("index_name", params.IndexName),
-		zap.String("query_text", params.QueryText),
-		zap.Int("vector_len", len(params.QueryVector)),
+		zap.String("query", params.QueryText),
 	)
 
-	g, gCtx := errgroup.WithContext(ctx)
+	var (
+		keywordRes []port.Document
+		vectorRes  []port.Document
+	)
 
-	var keywordDocs []port.Document
-	var vectorDocs []port.Document
+	g, ctx := errgroup.WithContext(ctx)
 
-	// KeywordSearch を並行実行
+	// キーワード検索は常に呼ぶ
 	g.Go(func() error {
-		var err error
-		keywordDocs, err = s.repo.KeywordSearch(gCtx, params.IndexName, params.QueryText)
+		docs, err := s.repo.KeywordSearch(ctx, params.IndexName, params.QueryText)
 		if err != nil {
-			s.logger.Error("failed to perform keyword search", zap.Error(err))
+			s.logger.Error("keyword search failed", zap.Error(err))
 			return err
+		}
+		if docs == nil {
+			keywordRes = []port.Document{}
+		} else {
+			keywordRes = docs
 		}
 		return nil
 	})
 
-	// VectorSearch を並行実行 (ベクトルが存在する場合のみ)
+	// VectorSearch は QueryVector が与えられている場合のみ並列で呼ぶ
 	if len(params.QueryVector) > 0 {
+		// capture vector
+		vector := params.QueryVector
 		g.Go(func() error {
-			var err error
-			vectorDocs, err = s.repo.VectorSearch(gCtx, params.IndexName, params.QueryVector)
+			docs, err := s.repo.VectorSearch(ctx, params.IndexName, vector)
 			if err != nil {
-				s.logger.Error("failed to perform vector search", zap.Error(err))
+				s.logger.Error("vector search failed", zap.Error(err))
 				return err
+			}
+			if docs == nil {
+				vectorRes = []port.Document{}
+			} else {
+				vectorRes = docs
 			}
 			return nil
 		})
+	} else {
+		// ensure zero value rather than nil for later processing
+		vectorRes = []port.Document{}
 	}
 
+	// Wait for both goroutines (or the single one + optional vector) to finish
 	if err := g.Wait(); err != nil {
+		// エラーはそのまま返す（呼び出し側でラップする場合は変更可）
 		return nil, err
 	}
 
 	// スコア統合ロジック
-	mergedDocs := make(map[string]port.Document)
+	merged := make(map[string]port.Document)
 
-	// キーワード検索結果をマージ
-	for _, doc := range keywordDocs {
-		mergedDocs[doc.ID] = doc
-	}
-
-	// ベクトル検索結果をマージ (スコアを加算)
-	for _, doc := range vectorDocs {
-		if existingDoc, ok := mergedDocs[doc.ID]; ok {
-			existingDoc.Score += doc.Score
-			mergedDocs[doc.ID] = existingDoc
-		} else {
-			mergedDocs[doc.ID] = doc
+	// まずキーワード結果を入れる
+	for _, d := range keywordRes {
+		// make a copy to avoid aliasing
+		merged[d.ID] = port.Document{
+			ID:     d.ID,
+			Score:  d.Score,
+			Fields: d.Fields,
 		}
 	}
 
-	// マップからスライスに変換
-	finalDocs := make([]port.Document, 0, len(mergedDocs))
-	for _, doc := range mergedDocs {
-		finalDocs = append(finalDocs, doc)
+	// ベクトル結果をマージ（存在すればスコアを加算、存在しなければ新規追加）
+	for _, vd := range vectorRes {
+		if existing, ok := merged[vd.ID]; ok {
+			// スコアを加算。Fields は既存（キーワード優先）に残すが、無ければベクトル側を使う。
+			existing.Score = existing.Score + vd.Score
+			if len(existing.Fields) == 0 {
+				existing.Fields = vd.Fields
+			}
+			merged[vd.ID] = existing
+		} else {
+			merged[vd.ID] = port.Document{
+				ID:     vd.ID,
+				Score:  vd.Score,
+				Fields: vd.Fields,
+			}
+		}
 	}
 
-	// スコアの降順でソート
+	// マップをスライスに変換してソート
+	finalDocs := make([]port.Document, 0, len(merged))
+	for _, d := range merged {
+		finalDocs = append(finalDocs, d)
+	}
+
+	// スコア降順ソート（高いものが先）
 	sort.Slice(finalDocs, func(i, j int) bool {
 		return finalDocs[i].Score > finalDocs[j].Score
 	})
@@ -98,7 +136,7 @@ func (s *searchService) Search(ctx context.Context, params port.SearchParams) (*
 		Documents:  finalDocs,
 	}
 
-	s.logger.Info("hybrid search process finished successfully",
+	s.logger.Info("search process finished successfully",
 		zap.Int64("hit_count", result.TotalCount),
 	)
 

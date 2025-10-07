@@ -18,4 +18,6 @@ type SearchResult struct {
 // SearchServiceはビジネスロジックのインターフェースです。
 type SearchService interface {
 	Search(ctx context.Context, params SearchParams) (*SearchResult, error)
+	IndexDocument(ctx context.Context, params IndexDocumentParams) error
+	DeleteDocument(ctx context.Context, indexName, documentID string) error
 }

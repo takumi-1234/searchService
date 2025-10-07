@@ -28,6 +28,16 @@ func (m *MockSearchService) Search(ctx context.Context, params port.SearchParams
 	return args.Get(0).(*port.SearchResult), args.Error(1)
 }
 
+func (m *MockSearchService) IndexDocument(ctx context.Context, params port.IndexDocumentParams) error {
+	args := m.Called(ctx, params)
+	return args.Error(0)
+}
+
+func (m *MockSearchService) DeleteDocument(ctx context.Context, indexName, documentID string) error {
+	args := m.Called(ctx, indexName, documentID)
+	return args.Error(0)
+}
+
 func TestServer_SearchDocuments(t *testing.T) {
 	logger := zap.NewNop()
 	ctx := context.Background()

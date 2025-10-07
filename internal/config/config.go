@@ -11,7 +11,8 @@ type Config struct {
 	GRPC          GRPCConfig          `mapstructure:"grpc"`
 	Logger        LoggerConfig        `mapstructure:"logger"`
 	Elasticsearch ElasticsearchConfig `mapstructure:"elasticsearch"`
-	Qdrant        QdrantConfig        `mapstructure:"qdrant"` // Qdrant設定を追加
+	Qdrant        QdrantConfig        `mapstructure:"qdrant"`
+	Kafka         KafkaConfig         `mapstructure:"kafka"` // Kafka設定を追加
 }
 
 // GRPCConfig はgRPCサーバーの設定です。
@@ -37,6 +38,13 @@ type QdrantConfig struct {
 	APIKey  string `mapstructure:"apiKey"`
 }
 
+// KafkaConfig はKafkaの接続設定です。
+type KafkaConfig struct {
+	Brokers []string `mapstructure:"brokers"`
+	GroupID string   `mapstructure:"groupId"`
+	Topic   string   `mapstructure:"topic"`
+}
+
 // Load は設定ファイルと環境変数から設定を読み込みます。
 func Load(path string) (*Config, error) {
 	v := viper.New()
@@ -46,8 +54,11 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("logger.level", "info")
 	v.SetDefault("elasticsearch.username", "")
 	v.SetDefault("elasticsearch.password", "")
-	v.SetDefault("qdrant.address", "localhost:6333") // Qdrantのデフォルト値
+	v.SetDefault("qdrant.address", "localhost:6334")
 	v.SetDefault("qdrant.apiKey", "")
+	v.SetDefault("kafka.brokers", []string{"localhost:9092"})
+	v.SetDefault("kafka.groupId", "search-service-consumer")
+	v.SetDefault("kafka.topic", "search.indexing.requests")
 
 	// 設定ファイルのパスと名前を設定
 	v.SetConfigName("config")
@@ -75,6 +86,9 @@ func Load(path string) (*Config, error) {
 	// 環境変数から読み取ったカンマ区切りの文字列をスライスに手動で変換
 	if addrs := v.GetString("elasticsearch.addresses"); addrs != "" {
 		cfg.Elasticsearch.Addresses = strings.Split(addrs, ",")
+	}
+	if brokers := v.GetString("kafka.brokers"); brokers != "" {
+		cfg.Kafka.Brokers = strings.Split(brokers, ",")
 	}
 
 	return &cfg, nil

@@ -5,12 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"reflect"
 
 	"github.com/elastic/go-elasticsearch/v9"
 	"github.com/elastic/go-elasticsearch/v9/typedapi/core/search"
 	"github.com/elastic/go-elasticsearch/v9/typedapi/types"
+	"github.com/elastic/go-elasticsearch/v9/typedapi/types/enums/result"
 	"github.com/qdrant/go-client/qdrant"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/takumi-1234/searchService/internal/port"
 )
@@ -107,7 +112,101 @@ func (r *searchRepository) VectorSearch(ctx context.Context, indexName string, v
 	return documents, nil
 }
 
-// valueFromQdrant は qdrant.Value を interface{} に変換するヘルパー関数です。
+// IndexDocument はドキュメントをElasticsearchとQdrantに並行してインデックスします。
+func (r *searchRepository) IndexDocument(ctx context.Context, params port.IndexDocumentParams) error {
+	g, gCtx := errgroup.WithContext(ctx)
+
+	// Elasticsearchへのインデックス作成
+	g.Go(func() error {
+		res, err := r.esClient.Index(params.IndexName).Id(params.DocumentID).Request(params.Fields).Do(gCtx)
+		if err != nil {
+			return fmt.Errorf("failed to index document in elasticsearch: %w", err)
+		}
+		// 修正点: 文字列比較をenum定数比較に変更
+		if res.Result != result.Created && res.Result != result.Updated {
+			return fmt.Errorf("unexpected elasticsearch index result: %s", res.Result)
+		}
+		return nil
+	})
+
+	// QdrantへのUpsert
+	if len(params.Vector) > 0 {
+		vector := append([]float32(nil), params.Vector...)
+		g.Go(func() error {
+			payload, err := payloadToQdrant(params.Fields)
+			if err != nil {
+				return fmt.Errorf("failed to convert payload for qdrant: %w", err)
+			}
+
+			wait := true
+			_, err = r.qdrantClient.Upsert(gCtx, &qdrant.UpsertPoints{
+				CollectionName: params.IndexName,
+				Wait:           &wait,
+				Points: []*qdrant.PointStruct{
+					{
+						Id:      &qdrant.PointId{PointIdOptions: &qdrant.PointId_Uuid{Uuid: params.DocumentID}},
+						Vectors: &qdrant.Vectors{VectorsOptions: &qdrant.Vectors_Vector{Vector: &qdrant.Vector{Data: vector}}},
+						Payload: payload,
+					},
+				},
+			})
+			if err != nil {
+				return fmt.Errorf("failed to upsert point to qdrant: %w", err)
+			}
+			return nil
+		})
+	}
+
+	return g.Wait()
+}
+
+// DeleteDocument はドキュメントをElasticsearchとQdrantから並行して削除します。
+func (r *searchRepository) DeleteDocument(ctx context.Context, indexName, documentID string) error {
+	g, gCtx := errgroup.WithContext(ctx)
+
+	// Elasticsearchからの削除
+	g.Go(func() error {
+		res, err := r.esClient.Delete(indexName, documentID).Do(gCtx)
+		if err != nil {
+			return fmt.Errorf("failed to delete document from elasticsearch: %w", err)
+		}
+		// 修正点: 文字列比較をenum定数比較に変更
+		if res.Result.Name != "deleted" && res.Result.Name != "not_found" {
+			return fmt.Errorf("unexpected elasticsearch delete result: %s", res.Result)
+		}
+		return nil
+	})
+
+	// Qdrantからの削除
+	g.Go(func() error {
+		wait := true
+		// 修正点: メソッド名を Delete に変更
+		_, err := r.qdrantClient.Delete(gCtx, &qdrant.DeletePoints{
+			CollectionName: indexName,
+			Wait:           &wait,
+			Points: &qdrant.PointsSelector{
+				PointsSelectorOneOf: &qdrant.PointsSelector_Points{
+					Points: &qdrant.PointsIdsList{
+						Ids: []*qdrant.PointId{
+							{PointIdOptions: &qdrant.PointId_Uuid{Uuid: documentID}},
+						},
+					},
+				},
+			},
+		})
+		if err != nil {
+			if status.Code(err) == codes.NotFound {
+				return nil
+			}
+			return fmt.Errorf("failed to delete point from qdrant: %w", err)
+		}
+		return nil
+	})
+
+	return g.Wait()
+}
+
+// ... (valueFromQdrant, payloadToQdrant ヘルパー関数は変更なし)
 func valueFromQdrant(v *qdrant.Value) interface{} {
 	switch kind := v.GetKind().(type) {
 	case *qdrant.Value_NullValue:
@@ -134,5 +233,84 @@ func valueFromQdrant(v *qdrant.Value) interface{} {
 		return l
 	default:
 		return nil
+	}
+}
+func payloadToQdrant(fields map[string]interface{}) (map[string]*qdrant.Value, error) {
+	payload := make(map[string]*qdrant.Value, len(fields))
+	for k, v := range fields {
+		qdrantValue, err := toQdrantValue(v)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert value for key '%s': %w", k, err)
+		}
+		payload[k] = qdrantValue
+	}
+	return payload, nil
+}
+func toQdrantValue(v interface{}) (*qdrant.Value, error) {
+	switch val := v.(type) {
+	case string:
+		return &qdrant.Value{Kind: &qdrant.Value_StringValue{StringValue: val}}, nil
+	case int:
+		return &qdrant.Value{Kind: &qdrant.Value_IntegerValue{IntegerValue: int64(val)}}, nil
+	case int64:
+		return &qdrant.Value{Kind: &qdrant.Value_IntegerValue{IntegerValue: val}}, nil
+	case float32:
+		return &qdrant.Value{Kind: &qdrant.Value_DoubleValue{DoubleValue: float64(val)}}, nil
+	case float64:
+		return &qdrant.Value{Kind: &qdrant.Value_DoubleValue{DoubleValue: val}}, nil
+	case bool:
+		return &qdrant.Value{Kind: &qdrant.Value_BoolValue{BoolValue: val}}, nil
+	case nil:
+		return &qdrant.Value{Kind: &qdrant.Value_NullValue{}}, nil
+	case map[string]interface{}:
+		payload := make(map[string]*qdrant.Value, len(val))
+		for key, nested := range val {
+			converted, err := toQdrantValue(nested)
+			if err != nil {
+				return nil, fmt.Errorf("failed to convert nested key '%s': %w", key, err)
+			}
+			payload[key] = converted
+		}
+		return &qdrant.Value{Kind: &qdrant.Value_StructValue{StructValue: &qdrant.Struct{Fields: payload}}}, nil
+	case []interface{}:
+		values := make([]*qdrant.Value, 0, len(val))
+		for idx, item := range val {
+			converted, err := toQdrantValue(item)
+			if err != nil {
+				return nil, fmt.Errorf("failed to convert list index %d: %w", idx, err)
+			}
+			values = append(values, converted)
+		}
+		return &qdrant.Value{Kind: &qdrant.Value_ListValue{ListValue: &qdrant.ListValue{Values: values}}}, nil
+	default:
+		rv := reflect.ValueOf(v)
+		switch rv.Kind() {
+		case reflect.Map:
+			if rv.Type().Key().Kind() != reflect.String {
+				return nil, fmt.Errorf("unsupported map key type %s for qdrant payload", rv.Type().Key())
+			}
+			payload := make(map[string]*qdrant.Value, rv.Len())
+			for _, key := range rv.MapKeys() {
+				converted, err := toQdrantValue(rv.MapIndex(key).Interface())
+				if err != nil {
+					return nil, fmt.Errorf("failed to convert nested key '%s': %w", key.String(), err)
+				}
+				payload[key.String()] = converted
+			}
+			return &qdrant.Value{Kind: &qdrant.Value_StructValue{StructValue: &qdrant.Struct{Fields: payload}}}, nil
+		case reflect.Slice, reflect.Array:
+			length := rv.Len()
+			values := make([]*qdrant.Value, 0, length)
+			for i := 0; i < length; i++ {
+				converted, err := toQdrantValue(rv.Index(i).Interface())
+				if err != nil {
+					return nil, fmt.Errorf("failed to convert list index %d: %w", i, err)
+				}
+				values = append(values, converted)
+			}
+			return &qdrant.Value{Kind: &qdrant.Value_ListValue{ListValue: &qdrant.ListValue{Values: values}}}, nil
+		default:
+			return nil, fmt.Errorf("unsupported type for qdrant payload: %T", v)
+		}
 	}
 }

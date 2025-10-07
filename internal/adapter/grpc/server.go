@@ -38,6 +38,15 @@ func (s *Server) SearchDocuments(ctx context.Context, req *searchv1.SearchDocume
 	params := port.SearchParams{
 		IndexName: req.GetIndexName(),
 		QueryText: req.GetQueryText(),
+		QueryVector: func() []float32 {
+			if len(req.GetQueryVector()) == 0 {
+				return nil
+			}
+			// Create a copy to avoid retaining protobuf backing array
+			vec := make([]float32, len(req.GetQueryVector()))
+			copy(vec, req.GetQueryVector())
+			return vec
+		}(),
 	}
 
 	searchResult, err := s.svc.Search(ctx, params)

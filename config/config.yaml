@@ -4,8 +4,6 @@ grpc:
 logger:
   level: "info"
 
-# docker-compose.yml内の環境変数で上書きされるため、
-# ここはローカルで `go run` する場合などのフォールバック値となります。
 elasticsearch:
   addresses:
     - "http://localhost:9200"
@@ -13,5 +11,11 @@ elasticsearch:
   password: ""
 
 qdrant:
-  address: "localhost:6333"
+  address: "localhost:6334"
   apiKey: ""
+
+kafka:
+  brokers:
+    - "localhost:9092"
+  groupId: "search-service-consumer"
+  topic: "search.indexing.requests"
