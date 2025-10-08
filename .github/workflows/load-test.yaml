@@ -1,0 +1,55 @@
+name: Load Test
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 18 * * 0"
+
+jobs:
+  k6-load-test:
+    name: k6 Load Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GO_VERSION: "1.24.7"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Start in-memory harness
+        run: |
+          go run ./tests/perf/harness &
+          echo $! > harness.pid
+          for attempt in $(seq 1 30); do
+            if nc -z 127.0.0.1 50071; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "harness did not become ready" >&2
+          exit 1
+
+      - name: Install k6
+        uses: grafana/setup-k6-action@v1
+        with:
+          version: v0.49.0
+
+      - name: Execute load test
+        env:
+          K6_VUS: 25
+          K6_DURATION: 1m
+          GRPC_TARGET: 127.0.0.1:50071
+        run: k6 run tests/perf/k6/search.js
+
+      - name: Stop harness
+        if: always()
+        run: |
+          if [ -f harness.pid ]; then
+            kill $(cat harness.pid) || true
+          fi

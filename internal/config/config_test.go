@@ -27,6 +27,11 @@ kafka:
     - "kafka:9092"
   groupId: "test-group"
   topic: "test-topic"
+search:
+  hybrid:
+    weights:
+      keyword: 0.7
+      vector: 0.3
 `
 		tempDir := t.TempDir()
 		configPath := filepath.Join(tempDir, "config.yaml")
@@ -44,6 +49,8 @@ kafka:
 		assert.Equal(t, []string{"kafka:9092"}, cfg.Kafka.Brokers)
 		assert.Equal(t, "test-group", cfg.Kafka.GroupID)
 		assert.Equal(t, "test-topic", cfg.Kafka.Topic)
+		assert.InDelta(t, 0.7, cfg.Search.Hybrid.Weights.Keyword, 1e-9)
+		assert.InDelta(t, 0.3, cfg.Search.Hybrid.Weights.Vector, 1e-9)
 	})
 
 	t.Run("正常系: 環境変数によってKafkaの値が上書きされること", func(t *testing.T) {
@@ -73,6 +80,8 @@ kafka:
 		assert.Equal(t, []string{"localhost:9092"}, cfg.Kafka.Brokers)
 		assert.Equal(t, "search-service-consumer", cfg.Kafka.GroupID)
 		assert.Equal(t, "search.indexing.requests", cfg.Kafka.Topic)
+		assert.InDelta(t, 0.5, cfg.Search.Hybrid.Weights.Keyword, 1e-9)
+		assert.InDelta(t, 0.5, cfg.Search.Hybrid.Weights.Vector, 1e-9)
 	})
 
 	t.Run("エラー系: 不正な形式のファイル", func(t *testing.T) {

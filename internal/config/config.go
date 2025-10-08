@@ -12,7 +12,9 @@ type Config struct {
 	Logger        LoggerConfig        `mapstructure:"logger"`
 	Elasticsearch ElasticsearchConfig `mapstructure:"elasticsearch"`
 	Qdrant        QdrantConfig        `mapstructure:"qdrant"`
-	Kafka         KafkaConfig         `mapstructure:"kafka"` // Kafka設定を追加
+	Kafka         KafkaConfig         `mapstructure:"kafka"`
+	Search        SearchConfig        `mapstructure:"search"`
+	Observability ObservabilityConfig `mapstructure:"observability"`
 }
 
 // GRPCConfig はgRPCサーバーの設定です。
@@ -45,6 +47,39 @@ type KafkaConfig struct {
 	Topic   string   `mapstructure:"topic"`
 }
 
+// SearchConfig は検索全般の設定です。
+type SearchConfig struct {
+	Hybrid HybridConfig `mapstructure:"hybrid"`
+}
+
+// HybridConfig はハイブリッド検索に関する設定です。
+type HybridConfig struct {
+	Weights HybridWeightsConfig `mapstructure:"weights"`
+}
+
+// HybridWeightsConfig はキーワード検索とベクトル検索の重みを定義します。
+type HybridWeightsConfig struct {
+	Keyword float64 `mapstructure:"keyword"`
+	Vector  float64 `mapstructure:"vector"`
+}
+
+// ObservabilityConfig はメトリクスおよびトレーシングの設定です。
+type ObservabilityConfig struct {
+	Metrics MetricsConfig `mapstructure:"metrics"`
+	Tracing TracingConfig `mapstructure:"tracing"`
+}
+
+// MetricsConfig はメトリクスエンドポイントの設定です。
+type MetricsConfig struct {
+	Address string `mapstructure:"address"`
+}
+
+// TracingConfig はトレースエクスポーターの設定です。
+type TracingConfig struct {
+	Endpoint string `mapstructure:"endpoint"`
+	Insecure bool   `mapstructure:"insecure"`
+}
+
 // Load は設定ファイルと環境変数から設定を読み込みます。
 func Load(path string) (*Config, error) {
 	v := viper.New()
@@ -59,6 +94,11 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("kafka.brokers", []string{"localhost:9092"})
 	v.SetDefault("kafka.groupId", "search-service-consumer")
 	v.SetDefault("kafka.topic", "search.indexing.requests")
+	v.SetDefault("search.hybrid.weights.keyword", 0.5)
+	v.SetDefault("search.hybrid.weights.vector", 0.5)
+	v.SetDefault("observability.metrics.address", ":9464")
+	v.SetDefault("observability.tracing.endpoint", "localhost:4318")
+	v.SetDefault("observability.tracing.insecure", true)
 
 	// 設定ファイルのパスと名前を設定
 	v.SetConfigName("config")

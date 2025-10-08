@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	searchv1 "github.com/takumi-1234/searchService/gen/proto/search/v1"
 	"github.com/takumi-1234/searchService/internal/port"
@@ -58,6 +59,7 @@ func TestServer_SearchDocuments(t *testing.T) {
 		params := port.SearchParams{
 			IndexName: req.GetIndexName(),
 			QueryText: req.GetQueryText(),
+			PageSize:  int(req.GetPageSize()),
 		}
 		serviceResult := &port.SearchResult{
 			TotalCount: 1,
@@ -104,6 +106,7 @@ func TestServer_SearchDocuments(t *testing.T) {
 		params := port.SearchParams{
 			IndexName: req.GetIndexName(),
 			QueryText: req.GetQueryText(),
+			PageSize:  int(req.GetPageSize()),
 		}
 		expectedErr := errors.New("service error")
 
@@ -116,6 +119,61 @@ func TestServer_SearchDocuments(t *testing.T) {
 		st, ok := status.FromError(err)
 		assert.True(t, ok)
 		assert.Equal(t, codes.Internal, st.Code())
+
+		mockSvc.AssertExpectations(t)
+	})
+
+	t.Run("正常系: フィルタとソート、ページサイズを変換できる", func(t *testing.T) {
+		mockSvc := new(MockSearchService)
+		server := NewServer(mockSvc, logger)
+
+		req := &searchv1.SearchDocumentsRequest{
+			IndexName: "advanced-index",
+			QueryText: "advanced query",
+			QueryVector: []float32{
+				0.1, 0.2,
+			},
+			PageSize: 5,
+			Filters: []*searchv1.Filter{
+				{
+					Field:    "category",
+					Operator: searchv1.Filter_OPERATOR_EQUAL,
+					Value:    structpb.NewStringValue("math"),
+				},
+				{
+					Field:    "score",
+					Operator: searchv1.Filter_OPERATOR_GREATER_THAN,
+					Value:    structpb.NewNumberValue(80),
+				},
+			},
+			SortBy: &searchv1.SortBy{
+				Field: "published_at",
+				Order: searchv1.SortBy_ORDER_DESC,
+			},
+		}
+
+		params := port.SearchParams{
+			IndexName: "advanced-index",
+			QueryText: "advanced query",
+			QueryVector: []float32{
+				0.1, 0.2,
+			},
+			PageSize: 5,
+			Filters: []port.SearchFilter{
+				{Field: "category", Operator: "eq", Value: "math"},
+				{Field: "score", Operator: "gt", Value: float64(80)},
+			},
+			Sort: &port.SearchSort{
+				Field: "published_at",
+				Order: "desc",
+			},
+		}
+
+		mockSvc.On("Search", ctx, params).Return(&port.SearchResult{}, nil).Once()
+
+		res, err := server.SearchDocuments(ctx, req)
+		assert.NoError(t, err)
+		assert.NotNil(t, res)
 
 		mockSvc.AssertExpectations(t)
 	})

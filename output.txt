@@ -1,3 +1,198 @@
+```Dockerfile 
+# Dockerfile
+
+FROM golang:1.23-bullseye AS builder
+
+ENV GOTOOLCHAIN=go1.24.7
+
+# ビルドに必要なツールをインストール（cgo/librdkafka 用のツールチェーンを含む）
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git \
+        curl \
+        build-essential \
+        pkg-config \
+        librdkafka-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# buf CLIをインストール
+RUN curl -sSL "https://github.com/bufbuild/buf/releases/latest/download/buf-Linux-x86_64" -o "/usr/local/bin/buf" && \
+    chmod +x "/usr/local/bin/buf"
+
+WORKDIR /app
+
+# go.mod と go.sum を先にコピーして依存関係をキャッシュ
+COPY go.mod go.sum ./
+RUN go mod download
+
+# proto定義とbuf設定ファイルをコピー
+COPY buf.yaml buf.gen.yaml ./
+# 修正点: `proto` ディレクトリは `api` ディレクトリ配下にあるため、`api` ディレクトリをコピーします。
+COPY api ./api
+
+# buf の依存関係をダウンロード
+RUN buf dep update
+# buf を使ってコードを生成
+# 修正点: --include-imports は外部依存関係のファイルまで `gen/` に出力してしまうため、通常は不要です。
+RUN buf generate
+
+# 残りのソースコードをコピー
+COPY . .
+
+# アプリケーションをビルド（Kafka クライアントは cgo が必須のため有効化）
+RUN CGO_ENABLED=1 GOOS=linux go build -o /search-service ./cmd/server
+
+FROM debian:bullseye-slim
+
+WORKDIR /
+
+# 依存ライブラリをインストール
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        librdkafka1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /search-service /search-service
+
+EXPOSE 50051
+
+ENTRYPOINT ["/search-service"]
+```
+---
+```makefile 
+# Makefile
+
+# ==============================================================================
+# Go variables
+# ==============================================================================
+BINARY_NAME=search-service
+BINARY_PATH=./cmd/server/main.go
+OUTPUT_DIR=./bin
+GO_SOURCES := $(shell find . -name '*.go' -not -path './gen/*' -not -path './bin/*' -not -path './.git/*')
+
+# ==============================================================================
+# Tools
+# ==============================================================================
+# .PHONY ディレクティブは、同名のファイルが存在してもターゲットを実行するようにします。
+.PHONY: all init test test-unit test-integration lint fmt fmt-check vet proto-lint ci build run clean docker-build docker-up docker-down docker-logs
+
+# デフォルトターゲット (make とだけ打った時に実行される)
+all: build
+
+# ==============================================================================
+# Development
+# ==============================================================================
+# init: 開発に必要なツールをインストールします
+init:
+	@echo ">> Installing development tools..."
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2
+	go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
+	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+
+# test: 全てのテスト（ユニット + インテグレーション）を実行します
+test: test-unit test-integration
+
+# test-unit: ユニットテストを実行します (レースコンディション検出とカバレッジレポート付き)
+test-unit:
+	@echo ">> Running unit tests..."
+	go test -race -cover ./...
+
+# test-integration: 統合テストを実行します
+test-integration:
+	@echo ">> Running integration tests..."
+	go test -tags=integration ./tests/integration/...
+
+# lint: golangci-lint を使って静的解析を実行します
+lint:
+	@echo ">> Running linter..."
+	golangci-lint run
+
+# fmt-check: goimports を使ってコードのフォーマット崩れを検出します
+fmt-check:
+	@echo ">> Checking goimports formatting..."
+	@command -v goimports >/dev/null 2>&1 || { \
+		echo "goimports is not installed. Run 'go install golang.org/x/tools/cmd/goimports@latest' first."; \
+		exit 1; \
+	}
+	@UNFORMATTED=$$(goimports -l $(GO_SOURCES)); \
+	if [ -n "$$UNFORMATTED" ]; then \
+		echo "The following files are not properly formatted (run 'make fmt'):"; \
+		echo "$$UNFORMATTED"; \
+		exit 1; \
+	fi
+
+# fmt: goimports を使ってコードをフォーマットします
+fmt:
+	@echo ">> Formatting code..."
+	@command -v goimports >/dev/null 2>&1 || { \
+		echo "goimports is not installed. Run 'go install golang.org/x/tools/cmd/goimports@latest' first."; \
+		exit 1; \
+	}
+	goimports -w .
+
+# vet: go vet を実行して静的解析を行います
+vet:
+	@echo ">> Running go vet..."
+	go vet ./...
+
+# proto-lint: Buf を用いて protobuf の lint を実行します
+proto-lint:
+	@echo ">> Running buf lint..."
+	buf lint
+
+# ci: CIで実行する検証をまとめて実行します
+ci:
+	@echo ">> Running aggregated CI checks..."
+	$(MAKE) fmt-check
+	$(MAKE) proto-lint
+	$(MAKE) lint
+	$(MAKE) vet
+	$(MAKE) test-unit
+
+# ==============================================================================
+# Build & Run
+# ==============================================================================
+# build: Goバイナリをビルドします
+build:
+	@echo ">> Building binary..."
+	go build -o $(OUTPUT_DIR)/$(BINARY_NAME) $(BINARY_PATH)
+
+# run: アプリケーションをローカルで実行します
+run:
+	@echo ">> Running application..."
+	go run $(BINARY_PATH)
+
+# clean: ビルドされたバイナリを削除します
+clean:
+	@echo ">> Cleaning up..."
+	rm -f $(OUTPUT_DIR)/$(BINARY_NAME)
+
+# ==============================================================================
+# Docker
+# ==============================================================================
+# docker-build: Dockerイメージをビルドします
+docker-build:
+	@echo ">> Building Docker image..."
+	docker-compose build
+
+# docker-up: Dockerコンテナをバックグラウンドで起動します
+docker-up:
+	@echo ">> Starting Docker containers..."
+	docker-compose up -d
+
+# docker-down: Dockerコンテナを停止・削除します
+docker-down:
+	@echo ">> Stopping Docker containers..."
+	docker-compose down
+
+# docker-logs: サービスのログを表示します
+docker-logs:
+	@echo ">> Tailing service logs..."
+	docker-compose logs -f search-service
+```
+---
 ```markdown 
 # README.md
 
@@ -40,67 +235,131 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os/signal"
+	"strings"
 	"syscall"
 
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/elastic/go-elasticsearch/v9"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
 
 	searchv1 "github.com/takumi-1234/searchService/gen/proto/search/v1"
 	grpc_adapter "github.com/takumi-1234/searchService/internal/adapter/grpc"
+	message_adapter "github.com/takumi-1234/searchService/internal/adapter/message"
+	"github.com/takumi-1234/searchService/internal/config"
 	"github.com/takumi-1234/searchService/internal/repository"
 	"github.com/takumi-1234/searchService/internal/service"
 )
 
 func main() {
-	// 1. ロガーの初期化
-	logger, err := zap.NewProduction()
+	cfg, err := config.Load("./config")
 	if err != nil {
-		panic(fmt.Sprintf("failed to initialize logger: %v", err))
+		log.Fatalf("failed to load config: %v", err)
 	}
-	defer logger.Sync()
+
+	loggerCfg := zap.NewProductionConfig()
+	if err := loggerCfg.Level.UnmarshalText([]byte(cfg.Logger.Level)); err != nil {
+		log.Printf("invalid logger level %q, falling back to info: %v", cfg.Logger.Level, err)
+		loggerCfg.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
+	}
+
+	logger, err := loggerCfg.Build()
+	if err != nil {
+		log.Fatalf("failed to initialize logger: %v", err)
+	}
+	defer func() {
+		if err := logger.Sync(); err != nil {
+			log.Printf("failed to sync logger: %v", err)
+		}
+	}()
 
 	logger.Info("starting search-service...")
 
-	// 2. 依存関係の注入 (DI)
-	// PoCではハードコードされたリポジトリを使用
-	pocRepo := repository.NewElasticsearchPocRepository()
-	searchSvc := service.NewSearchService(pocRepo, logger)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Elasticsearchクライアントの初期化
+	esCfg := elasticsearch.Config{
+		Addresses: cfg.Elasticsearch.Addresses,
+		Username:  cfg.Elasticsearch.Username,
+		Password:  cfg.Elasticsearch.Password,
+	}
+	esTypedClient, err := elasticsearch.NewTypedClient(esCfg)
+	if err != nil {
+		logger.Fatal("failed to create elasticsearch client", zap.Error(err))
+	}
+
+	// Qdrantクライアントの初期化
+	qdrantConn, err := grpc.NewClient(cfg.Qdrant.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		logger.Fatal("failed to connect to qdrant", zap.Error(err))
+	}
+	defer qdrantConn.Close()
+
+	// 統合リポジトリのインスタンス化
+	searchRepo := repository.NewSearchRepository(esTypedClient, qdrantConn)
+
+	searchSvc := service.NewSearchService(searchRepo, logger)
 	grpcServer := grpc_adapter.NewServer(searchSvc, logger)
 
-	// 3. gRPCサーバーのセットアップ
-	port := 50051
+	// Kafkaコンシューマの初期化
+	consumer, err := kafka.NewConsumer(&kafka.ConfigMap{
+		"bootstrap.servers": strings.Join(cfg.Kafka.Brokers, ","),
+		"group.id":          cfg.Kafka.GroupID,
+		"auto.offset.reset": "earliest",
+	})
+	if err != nil {
+		logger.Fatal("failed to create kafka consumer", zap.Error(err))
+	}
+
+	msgConsumer := message_adapter.NewConsumer(consumer, searchSvc, logger, cfg.Kafka.Topic)
+
+	port := cfg.GRPC.Port
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		logger.Fatal("failed to listen", zap.Error(err))
+		logger.Fatal("failed to listen", zap.Int("port", port), zap.Error(err))
 	}
 
 	s := grpc.NewServer()
 	searchv1.RegisterSearchServiceServer(s, grpcServer)
-
-	// gRPCサーバーリフレクションを有効にする
 	reflection.Register(s)
 
-	// 4. Graceful Shutdown のためのシグナルハンドリング
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	g, gctx := errgroup.WithContext(ctx)
 
-	// 5. gRPCサーバーを別ゴルーチンで起動
-	go func() {
-		logger.Info(fmt.Sprintf("gRPC server listening at %v", lis.Addr()))
+	g.Go(func() error {
+		logger.Info("gRPC server listening", zap.String("address", lis.Addr().String()))
 		if err := s.Serve(lis); err != nil {
-			logger.Fatal("failed to serve", zap.Error(err))
+			if errors.Is(err, grpc.ErrServerStopped) {
+				return nil
+			}
+			return fmt.Errorf("failed to serve gRPC server: %w", err)
 		}
-	}()
+		return nil
+	})
 
-	// シャットダウンシグナルを待機
+	g.Go(func() error {
+		if err := msgConsumer.Run(gctx); err != nil && !errors.Is(err, context.Canceled) {
+			return fmt.Errorf("kafka consumer run failed: %w", err)
+		}
+		return nil
+	})
+
 	<-ctx.Done()
 
 	logger.Info("shutting down gRPC server...")
 	s.GracefulStop()
+	logger.Info("waiting for background workers to stop...")
+	if err := g.Wait(); err != nil {
+		logger.Error("background worker exited with error", zap.Error(err))
+	}
 	logger.Info("server gracefully stopped")
 }
 ```
@@ -108,6 +367,27 @@ func main() {
 ```yaml 
 # config/config.yaml
 
+grpc:
+  port: 50051
+
+logger:
+  level: "info"
+
+elasticsearch:
+  addresses:
+    - "http://localhost:9200"
+  username: ""
+  password: ""
+
+qdrant:
+  address: "localhost:6334"
+  apiKey: ""
+
+kafka:
+  brokers:
+    - "localhost:9092"
+  groupId: "search-service-consumer"
+  topic: "search.indexing.requests"
 ```
 ---
 ```yaml 
@@ -123,8 +403,6 @@ func main() {
 ```yaml 
 # docker-compose.yml
 
-version: '3.8'
-
 services:
   search-service:
     build:
@@ -132,12 +410,183 @@ services:
       dockerfile: Dockerfile
     ports:
       - "50051:50051"
+    environment:
+      - SEARCH_ELASTICSEARCH_ADDRESSES=http://elasticsearch:9200
+      - SEARCH_QDRANT_ADDRESS=qdrant:6334
+      - SEARCH_KAFKA_BROKERS=kafka:9092
+      - SEARCH_KAFKA_GROUPID=search-service-consumer
+      - SEARCH_KAFKA_TOPIC=search.indexing.requests
+    depends_on:
+      - elasticsearch
+      - qdrant
+      - kafka
     networks:
       - search_net
 
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.1.0
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    networks:
+      - search_net
+
+  qdrant:
+    image: qdrant/qdrant:v1.9.1
+    ports:
+      - "6333:6333" # REST port
+      - "6334:6334" # gRPC port
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - search_net
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - search_net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    networks:
+      - search_net
+
+volumes:
+  es_data:
+    driver: local
+  qdrant_data:
+    driver: local
+
 networks:
   search_net:
-    driver: bridge```
+    driver: bridge
+```
+---
+```markdown 
+# docs/ci-cd.md
+
+# CI/CD Pipeline Reference
+
+This project relies on a single source of truth for verification: the `make ci` target. Local developers and GitHub Actions share the exact same steps, which keeps feedback loops short and reproducible.
+
+## Local Verification
+
+- `make fmt-check`: Fails if any Go file (excluding `gen/`) is not formatted by `goimports`.
+- `make proto-lint`: Runs `buf lint` against every protobuf definition below `api/`.
+- `make lint`: Executes `golangci-lint run` with the default rule set.
+- `make vet`: Runs `go vet ./...`.
+- `make test-unit`: Executes unit tests with race detection and coverage.
+- `make test-integration`: Spins up Elasticsearch, Qdrant, and Kafka via `testcontainers-go` and runs integration suites (requires Docker).
+- `make ci`: Aggregates `fmt-check`, `proto-lint`, `lint`, `vet`, and `test-unit` in the same order as CI.
+- `docker build -t search-service:local .`: Validates Docker image creation when testing locally.
+
+### Tooling Requirements
+
+Install the following once per development machine:
+
+```bash
+go install golang.org/x/tools/cmd/goimports@latest
+go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+```
+
+Buf is provisioned in CI. Locally, install it with `brew install bufbuild/buf/buf` or by downloading from the official release page.
+
+## GitHub Actions Workflow
+
+File: `.github/workflows/ci.yaml`
+
+1. Checkout repository and set up Go `1.24.7` with dependency caching.
+2. Install the Buf CLI for protobuf linting.
+3. Add `${HOME}/go/bin` to `PATH`, download Go modules, and install `goimports` plus `golangci-lint`.
+4. Run `make ci`, which in turn performs:
+   - `goimports` formatting check
+   - `buf lint`
+   - `golangci-lint run`
+   - `go vet ./...`
+   - `go test -race -cover ./...`
+5. Execute `make test-integration` (with `TESTCONTAINERS_RYUK_DISABLED=true`) to verify the asynchronous Elasticsearch/Qdrant/Kafka flow.
+6. On pushes to `main`, build the Docker image (`docker build -t search-service:${GITHUB_SHA} .`) to keep the delivery pipeline green.
+
+Any failure in these stages blocks merges, ensuring that formatting, protobuf contracts, linting, tests, and container builds stay synchronized.
+```
+---
+```markdown 
+# docs/repository-structure.md
+
+# Repository Strategy and Layout
+
+This service follows a polyrepo model: each deployable service is kept in its own repository. Shared utilities must be published as standalone Go modules and consumed via versioned tags; never import code directly from another service with `replace` directives.
+
+## Directory Template
+
+Every new component or generated artifact must live under one of the predefined roots. The tree below shows the canonical layout (omitting temporary files and build artifacts):
+
+```
+searchService/
+├── api/                 # API contracts (OpenAPI/proto) and schemas
+│   └── proto/           # Protobuf sources compiled by Buf
+├── cmd/                 # Entrypoints (one package per binary)
+│   └── server/main.go
+├── config/              # Default configuration (override via env)
+├── docs/                # Architecture and workflow documentation
+├── gen/                 # Generated code (protoc, buf, etc.)
+├── internal/            # Non-exported application packages
+│   ├── adapter/         # gRPC, Kafka and other I/O adapters
+│   ├── config/          # Runtime configuration loader
+│   ├── port/            # Hexagonal ports (service/repository interfaces)
+│   ├── repository/      # Data access implementations (ES, Qdrant, …)
+│   └── service/         # Domain logic
+├── tests/
+│   ├── integration/     # Testcontainers-based integration tests
+│   └── e2e/             # Reserved for end-to-end flows
+├── deployments/         # Deployment manifests (Kubernetes, Helm, etc.)
+├── scripts/             # Developer tooling and automation
+├── .github/workflows/   # CI/CD pipelines
+├── Dockerfile
+├── docker-compose.yml
+├── go.mod / go.sum
+└── Makefile
+```
+
+## Guardrails
+
+- Only files under `internal/` may depend on adapters or repositories; keep business logic behind `internal/service`.
+- Generated code always lives under `gen/` and must never be edited manually. Regenerate via `buf generate` followed by `go generate` when applicable.
+- New APIs require updates in **both** `api/proto` and the corresponding adapter/service packages before implementation work starts.
+- Tests are mandatory for new features:
+  - Unit tests in the closest package (e.g., `internal/service/..._test.go`).
+  - Integration tests in `tests/integration` when an external system (Elasticsearch, Qdrant, Kafka) is involved.
+- Automation defaults:
+  - `make lint` runs `golangci-lint`.
+  - `make test-unit` executes `go test -race ./...`.
+  - `make test-integration` runs tagged integration suites (`testcontainers-go`).
+
+Keep this template in sync with the CI pipeline and developer onboarding docs whenever the structure changes.
+```
 ---
 ```go 
 # file_output.go
@@ -193,10 +642,19 @@ func main() {
 			return err
 		}
 
-		fmt.Fprintf(out, "```%s \n# %s\n\n", lang, path)
-		out.Write(content)
-		fmt.Fprintln(out, "```")
-		fmt.Fprintln(out, "---")
+		// エラーをすべてチェック
+		if _, err := fmt.Fprintf(out, "```%s \n# %s\n\n", lang, path); err != nil {
+			return err
+		}
+		if _, err := out.Write(content); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintln(out, "```"); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintln(out, "---"); err != nil {
+			return err
+		}
 
 		return nil
 	})
@@ -229,7 +687,7 @@ func shouldIgnorePath(path string) bool {
 	lower := strings.ToLower(path)
 	return strings.Contains(lower, "min.js") ||
 		strings.Contains(lower, ".lock") ||
-		strings.Contains(lower, ".DS_Store")
+		strings.Contains(lower, ".ds_store")
 }
 
 func detectLanguage(path string) string {
@@ -251,11 +709,11 @@ func detectLanguage(path string) string {
 		return "text"
 	case ".sh":
 		return "bash"
-	case ".Dockerfile", "dockerfile":
+	case ".dockerfile":
 		return "Dockerfile"
 	case ".gitignore":
 		return ""
-	case ".makefile", "makefile":
+	case ".makefile":
 		return "makefile"
 	case ".html":
 		return "html"
@@ -270,6 +728,14 @@ func detectLanguage(path string) string {
 	case ".sql":
 		return "sql"
 	default:
+		// ファイル名が Dockerfile や Makefile のように拡張子なしで特定できるものに対応
+		base := strings.ToLower(filepath.Base(path))
+		if base == "dockerfile" {
+			return "Dockerfile"
+		}
+		if base == "makefile" {
+			return "makefile"
+		}
 		return ""
 	}
 }
@@ -1486,6 +1952,8 @@ package grpc
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -1522,6 +1990,15 @@ func (s *Server) SearchDocuments(ctx context.Context, req *searchv1.SearchDocume
 	params := port.SearchParams{
 		IndexName: req.GetIndexName(),
 		QueryText: req.GetQueryText(),
+		QueryVector: func() []float32 {
+			if len(req.GetQueryVector()) == 0 {
+				return nil
+			}
+			// Create a copy to avoid retaining protobuf backing array
+			vec := make([]float32, len(req.GetQueryVector()))
+			copy(vec, req.GetQueryVector())
+			return vec
+		}(),
 	}
 
 	searchResult, err := s.svc.Search(ctx, params)
@@ -1549,6 +2026,114 @@ func (s *Server) SearchDocuments(ctx context.Context, req *searchv1.SearchDocume
 		Results:    results,
 		TotalCount: searchResult.TotalCount,
 	}, nil
+}
+
+// CreateIndex は CreateIndex RPC を処理します。
+func (s *Server) CreateIndex(ctx context.Context, req *searchv1.CreateIndexRequest) (*searchv1.CreateIndexResponse, error) {
+	if req.GetIndexName() == "" {
+		s.logger.Warn("index_name is empty")
+		return nil, status.Error(codes.InvalidArgument, "index_name is a required field")
+	}
+
+	params, err := buildCreateIndexParams(req)
+	if err != nil {
+		s.logger.Warn("invalid create index request", zap.Error(err))
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	if err := s.svc.CreateIndex(ctx, params); err != nil {
+		s.logger.Error("failed to create index", zap.String("index_name", params.IndexName), zap.Error(err))
+		return nil, status.Error(grpcCodeForCreateIndexError(err), "failed to create index")
+	}
+
+	return &searchv1.CreateIndexResponse{
+		Success: true,
+		Message: fmt.Sprintf("index %s created", params.IndexName),
+	}, nil
+}
+
+func buildCreateIndexParams(req *searchv1.CreateIndexRequest) (port.CreateIndexParams, error) {
+	schema := req.GetSchema()
+	if schema == nil {
+		return port.CreateIndexParams{}, fmt.Errorf("schema is required")
+	}
+
+	fields := make([]port.FieldDefinition, 0, len(schema.GetFields()))
+	for _, field := range schema.GetFields() {
+		if field.GetName() == "" {
+			return port.CreateIndexParams{}, fmt.Errorf("field name is required")
+		}
+		fieldType, err := convertProtoFieldType(field.GetType())
+		if err != nil {
+			return port.CreateIndexParams{}, err
+		}
+		fields = append(fields, port.FieldDefinition{
+			Name: field.GetName(),
+			Type: fieldType,
+		})
+	}
+
+	vectorCfg := schema.GetVectorConfig()
+	if vectorCfg == nil {
+		return port.CreateIndexParams{}, fmt.Errorf("vector_config is required")
+	}
+	if vectorCfg.GetDimension() <= 0 {
+		return port.CreateIndexParams{}, fmt.Errorf("vector dimension must be positive")
+	}
+
+	distance, err := convertProtoVectorDistance(vectorCfg.GetDistance())
+	if err != nil {
+		return port.CreateIndexParams{}, err
+	}
+
+	return port.CreateIndexParams{
+		IndexName: req.GetIndexName(),
+		Fields:    fields,
+		VectorConfig: &port.VectorConfig{
+			Dimension: int(vectorCfg.GetDimension()),
+			Distance:  distance,
+		},
+	}, nil
+}
+
+func convertProtoFieldType(fieldType searchv1.FieldDefinition_FieldType) (string, error) {
+	switch fieldType {
+	case searchv1.FieldDefinition_FIELD_TYPE_TEXT:
+		return port.FieldTypeText, nil
+	case searchv1.FieldDefinition_FIELD_TYPE_KEYWORD:
+		return port.FieldTypeKeyword, nil
+	case searchv1.FieldDefinition_FIELD_TYPE_INTEGER:
+		return port.FieldTypeInteger, nil
+	case searchv1.FieldDefinition_FIELD_TYPE_FLOAT:
+		return port.FieldTypeFloat, nil
+	case searchv1.FieldDefinition_FIELD_TYPE_BOOLEAN:
+		return port.FieldTypeBoolean, nil
+	case searchv1.FieldDefinition_FIELD_TYPE_DATE:
+		return port.FieldTypeDate, nil
+	default:
+		return "", fmt.Errorf("unsupported field type: %s", fieldType.String())
+	}
+}
+
+func convertProtoVectorDistance(distance searchv1.VectorConfig_Distance) (port.VectorDistance, error) {
+	switch distance {
+	case searchv1.VectorConfig_DISTANCE_COSINE:
+		return port.VectorDistanceCosine, nil
+	case searchv1.VectorConfig_DISTANCE_EUCLID:
+		return port.VectorDistanceEuclid, nil
+	case searchv1.VectorConfig_DISTANCE_DOT_PRODUCT:
+		return port.VectorDistanceDot, nil
+	default:
+		return "", fmt.Errorf("unsupported vector distance: %s", distance.String())
+	}
+}
+
+func grpcCodeForCreateIndexError(err error) codes.Code {
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "already exists") {
+		return codes.AlreadyExists
+	}
+	return codes.Internal
 }
 ```
 ---
@@ -1583,6 +2168,21 @@ func (m *MockSearchService) Search(ctx context.Context, params port.SearchParams
 		return nil, args.Error(1)
 	}
 	return args.Get(0).(*port.SearchResult), args.Error(1)
+}
+
+func (m *MockSearchService) IndexDocument(ctx context.Context, params port.IndexDocumentParams) error {
+	args := m.Called(ctx, params)
+	return args.Error(0)
+}
+
+func (m *MockSearchService) DeleteDocument(ctx context.Context, indexName, documentID string) error {
+	args := m.Called(ctx, indexName, documentID)
+	return args.Error(0)
+}
+
+func (m *MockSearchService) CreateIndex(ctx context.Context, params port.CreateIndexParams) error {
+	args := m.Called(ctx, params)
+	return args.Error(0)
 }
 
 func TestServer_SearchDocuments(t *testing.T) {
@@ -1662,6 +2262,112 @@ func TestServer_SearchDocuments(t *testing.T) {
 		mockSvc.AssertExpectations(t)
 	})
 }
+
+func TestServer_CreateIndex(t *testing.T) {
+	logger := zap.NewNop()
+	ctx := context.Background()
+
+	t.Run("正常系: インデックス作成が成功する", func(t *testing.T) {
+		mockSvc := new(MockSearchService)
+		server := NewServer(mockSvc, logger)
+
+		req := &searchv1.CreateIndexRequest{
+			IndexName: "test-index",
+			Schema: &searchv1.IndexSchema{
+				Fields: []*searchv1.FieldDefinition{
+					{Name: "content", Type: searchv1.FieldDefinition_FIELD_TYPE_TEXT},
+					{Name: "published_at", Type: searchv1.FieldDefinition_FIELD_TYPE_DATE},
+				},
+				VectorConfig: &searchv1.VectorConfig{
+					Dimension: 3,
+					Distance:  searchv1.VectorConfig_DISTANCE_COSINE,
+				},
+			},
+		}
+
+		expectedParams := port.CreateIndexParams{
+			IndexName: "test-index",
+			Fields: []port.FieldDefinition{
+				{Name: "content", Type: port.FieldTypeText},
+				{Name: "published_at", Type: port.FieldTypeDate},
+			},
+			VectorConfig: &port.VectorConfig{
+				Dimension: 3,
+				Distance:  port.VectorDistanceCosine,
+			},
+		}
+
+		mockSvc.On("CreateIndex", ctx, expectedParams).Return(nil).Once()
+
+		res, err := server.CreateIndex(ctx, req)
+
+		assert.NoError(t, err)
+		assert.NotNil(t, res)
+		assert.True(t, res.Success)
+		assert.Contains(t, res.Message, "test-index")
+
+		mockSvc.AssertExpectations(t)
+	})
+
+	t.Run("エラー系: index_name が空", func(t *testing.T) {
+		mockSvc := new(MockSearchService)
+		server := NewServer(mockSvc, logger)
+		req := &searchv1.CreateIndexRequest{IndexName: ""}
+
+		res, err := server.CreateIndex(ctx, req)
+
+		assert.Error(t, err)
+		assert.Nil(t, res)
+		st, ok := status.FromError(err)
+		assert.True(t, ok)
+		assert.Equal(t, codes.InvalidArgument, st.Code())
+
+		mockSvc.AssertNotCalled(t, "CreateIndex", mock.Anything, mock.Anything)
+		mockSvc.AssertExpectations(t)
+	})
+
+	t.Run("エラー系: サービス層がエラーを返す", func(t *testing.T) {
+		mockSvc := new(MockSearchService)
+		server := NewServer(mockSvc, logger)
+
+		req := &searchv1.CreateIndexRequest{
+			IndexName: "existing-index",
+			Schema: &searchv1.IndexSchema{
+				Fields: []*searchv1.FieldDefinition{
+					{Name: "content", Type: searchv1.FieldDefinition_FIELD_TYPE_TEXT},
+				},
+				VectorConfig: &searchv1.VectorConfig{
+					Dimension: 3,
+					Distance:  searchv1.VectorConfig_DISTANCE_COSINE,
+				},
+			},
+		}
+
+		expectedParams := port.CreateIndexParams{
+			IndexName: "existing-index",
+			Fields: []port.FieldDefinition{
+				{Name: "content", Type: port.FieldTypeText},
+			},
+			VectorConfig: &port.VectorConfig{
+				Dimension: 3,
+				Distance:  port.VectorDistanceCosine,
+			},
+		}
+
+		expectedErr := errors.New("index already exists")
+		mockSvc.On("CreateIndex", ctx, expectedParams).Return(expectedErr).Once()
+
+		res, err := server.CreateIndex(ctx, req)
+
+		assert.Error(t, err)
+		assert.Nil(t, res)
+		st, ok := status.FromError(err)
+		assert.True(t, ok)
+		assert.Equal(t, codes.AlreadyExists, st.Code())
+
+		mockSvc.AssertExpectations(t)
+	})
+}
 ```
 ---
 ```go 
@@ -1669,8 +2375,107 @@ func TestServer_SearchDocuments(t *testing.T) {
 
 package message
 
-// このファイルはelasticsearchリポジトリの実装用です。
-// PoCの段階ではまだ実装しません。
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"go.uber.org/zap"
+
+	"github.com/takumi-1234/searchService/internal/port"
+)
+
+// DocumentIndexRequest はKafkaメッセージのペイロードスキーマです。
+type DocumentIndexRequest struct {
+	Payload struct {
+		IndexName  string                 `json:"index_name"`
+		DocumentID string                 `json:"document_id"`
+		Action     string                 `json:"action"`
+		Fields     map[string]interface{} `json:"fields"`
+		Vector     []float32              `json:"vector"`
+	} `json:"payload"`
+}
+
+// Consumer はKafkaメッセージを消費し、ビジネスロジックを呼び出します。
+type Consumer struct {
+	consumer *kafka.Consumer
+	svc      port.SearchService
+	logger   *zap.Logger
+	topic    string
+}
+
+// NewConsumer は新しいConsumerインスタンスを生成します。
+func NewConsumer(consumer *kafka.Consumer, svc port.SearchService, logger *zap.Logger, topic string) *Consumer {
+	return &Consumer{
+		consumer: consumer,
+		svc:      svc,
+		logger:   logger,
+		topic:    topic,
+	}
+}
+
+// Run はKafkaコンシューマを開始します。
+func (c *Consumer) Run(ctx context.Context) error {
+	if err := c.consumer.Subscribe(c.topic, nil); err != nil {
+		return err
+	}
+	c.logger.Info("kafka consumer started", zap.String("topic", c.topic))
+
+	for {
+		select {
+		case <-ctx.Done():
+			c.logger.Info("shutting down kafka consumer")
+			return c.consumer.Close()
+		default:
+			msg, err := c.consumer.ReadMessage(100 * time.Millisecond)
+			if err != nil {
+				var kafkaErr kafka.Error
+				if errors.As(err, &kafkaErr) && kafkaErr.Code() == kafka.ErrTimedOut {
+					// タイムアウトエラーは無視
+					continue
+				}
+				c.logger.Error("kafka read error", zap.Error(err))
+				continue
+			}
+
+			if err := c.handleMessage(ctx, msg); err != nil {
+				c.logger.Error("failed to handle kafka message",
+					zap.String("topic", *msg.TopicPartition.Topic),
+					zap.ByteString("key", msg.Key),
+					zap.Error(err),
+				)
+			}
+		}
+	}
+}
+
+// handleMessage は単一のKafkaメッセージを処理します。
+func (c *Consumer) handleMessage(ctx context.Context, msg *kafka.Message) error {
+	var req DocumentIndexRequest
+	if err := json.Unmarshal(msg.Value, &req); err != nil {
+		return err
+	}
+
+	payload := req.Payload
+	switch payload.Action {
+	case "UPSERT":
+		params := port.IndexDocumentParams{
+			IndexName:  payload.IndexName,
+			DocumentID: payload.DocumentID,
+			Fields:     payload.Fields,
+			Vector:     payload.Vector,
+		}
+		return c.svc.IndexDocument(ctx, params)
+	case "DELETE":
+		return c.svc.DeleteDocument(ctx, payload.IndexName, payload.DocumentID)
+	default:
+		c.logger.Warn("unknown action in kafka message", zap.String("action", payload.Action))
+	}
+
+	return nil
+}
 ```
 ---
 ```go 
@@ -1678,8 +2483,192 @@ package message
 
 package config
 
-// このファイルはelasticsearchリポジトリの実装用です。
-// PoCの段階ではまだ実装しません。
+import (
+	"strings"
+
+	"github.com/spf13/viper"
+)
+
+// Config はアプリケーション全体の設定を保持します。
+type Config struct {
+	GRPC          GRPCConfig          `mapstructure:"grpc"`
+	Logger        LoggerConfig        `mapstructure:"logger"`
+	Elasticsearch ElasticsearchConfig `mapstructure:"elasticsearch"`
+	Qdrant        QdrantConfig        `mapstructure:"qdrant"`
+	Kafka         KafkaConfig         `mapstructure:"kafka"` // Kafka設定を追加
+}
+
+// GRPCConfig はgRPCサーバーの設定です。
+type GRPCConfig struct {
+	Port int `mapstructure:"port"`
+}
+
+// LoggerConfig はロガーの設定です。
+type LoggerConfig struct {
+	Level string `mapstructure:"level"`
+}
+
+// ElasticsearchConfig はElasticsearchの接続設定です。
+type ElasticsearchConfig struct {
+	Addresses []string `mapstructure:"addresses"`
+	Username  string   `mapstructure:"username"`
+	Password  string   `mapstructure:"password"`
+}
+
+// QdrantConfig はQdrantの接続設定です。
+type QdrantConfig struct {
+	Address string `mapstructure:"address"`
+	APIKey  string `mapstructure:"apiKey"`
+}
+
+// KafkaConfig はKafkaの接続設定です。
+type KafkaConfig struct {
+	Brokers []string `mapstructure:"brokers"`
+	GroupID string   `mapstructure:"groupId"`
+	Topic   string   `mapstructure:"topic"`
+}
+
+// Load は設定ファイルと環境変数から設定を読み込みます。
+func Load(path string) (*Config, error) {
+	v := viper.New()
+
+	// デフォルト値の設定
+	v.SetDefault("grpc.port", 50051)
+	v.SetDefault("logger.level", "info")
+	v.SetDefault("elasticsearch.username", "")
+	v.SetDefault("elasticsearch.password", "")
+	v.SetDefault("qdrant.address", "localhost:6334")
+	v.SetDefault("qdrant.apiKey", "")
+	v.SetDefault("kafka.brokers", []string{"localhost:9092"})
+	v.SetDefault("kafka.groupId", "search-service-consumer")
+	v.SetDefault("kafka.topic", "search.indexing.requests")
+
+	// 設定ファイルのパスと名前を設定
+	v.SetConfigName("config")
+	v.SetConfigType("yaml")
+	v.AddConfigPath(path)
+
+	// 環境変数の設定
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.SetEnvPrefix("SEARCH")
+	v.AutomaticEnv()
+
+	// 設定ファイルの読み込み
+	if err := v.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+			return nil, err
+		}
+	}
+
+	// 構造体へのアンマーシャル
+	var cfg Config
+	if err := v.Unmarshal(&cfg); err != nil {
+		return nil, err
+	}
+
+	// 環境変数から読み取ったカンマ区切りの文字列をスライスに手動で変換
+	if addrs := v.GetString("elasticsearch.addresses"); addrs != "" {
+		cfg.Elasticsearch.Addresses = strings.Split(addrs, ",")
+	}
+	if brokers := v.GetString("kafka.brokers"); brokers != "" {
+		cfg.Kafka.Brokers = strings.Split(brokers, ",")
+	}
+
+	return &cfg, nil
+}
+```
+---
+```go 
+# internal/config/config_test.go
+
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestLoad(t *testing.T) {
+	t.Run("正常系: ファイルから全ての値が読み込めること", func(t *testing.T) {
+		configYAML := `
+grpc:
+  port: 8080
+logger:
+  level: "debug"
+elasticsearch:
+  addresses:
+    - "http://localhost:9200"
+qdrant:
+  address: "localhost:1234"
+  apiKey: "test-key"
+kafka:
+  brokers:
+    - "kafka:9092"
+  groupId: "test-group"
+  topic: "test-topic"
+`
+		tempDir := t.TempDir()
+		configPath := filepath.Join(tempDir, "config.yaml")
+		err := os.WriteFile(configPath, []byte(configYAML), 0600)
+		require.NoError(t, err)
+
+		cfg, err := Load(tempDir)
+		require.NoError(t, err)
+
+		assert.Equal(t, 8080, cfg.GRPC.Port)
+		assert.Equal(t, "debug", cfg.Logger.Level)
+		assert.Equal(t, []string{"http://localhost:9200"}, cfg.Elasticsearch.Addresses)
+		assert.Equal(t, "localhost:1234", cfg.Qdrant.Address)
+		assert.Equal(t, "test-key", cfg.Qdrant.APIKey)
+		assert.Equal(t, []string{"kafka:9092"}, cfg.Kafka.Brokers)
+		assert.Equal(t, "test-group", cfg.Kafka.GroupID)
+		assert.Equal(t, "test-topic", cfg.Kafka.Topic)
+	})
+
+	t.Run("正常系: 環境変数によってKafkaの値が上書きされること", func(t *testing.T) {
+		tempDir := t.TempDir()
+
+		t.Setenv("SEARCH_KAFKA_BROKERS", "kafka1:9092,kafka2:9092")
+		t.Setenv("SEARCH_KAFKA_GROUPID", "env-group")
+		t.Setenv("SEARCH_KAFKA_TOPIC", "env-topic")
+
+		cfg, err := Load(tempDir)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"kafka1:9092", "kafka2:9092"}, cfg.Kafka.Brokers)
+		assert.Equal(t, "env-group", cfg.Kafka.GroupID)
+		assert.Equal(t, "env-topic", cfg.Kafka.Topic)
+	})
+
+	t.Run("正常系: デフォルト値が適用されること", func(t *testing.T) {
+		tempDir := t.TempDir()
+
+		cfg, err := Load(tempDir)
+		require.NoError(t, err)
+
+		assert.Equal(t, 50051, cfg.GRPC.Port)
+		assert.Equal(t, "info", cfg.Logger.Level)
+		assert.Equal(t, "localhost:6334", cfg.Qdrant.Address)
+		assert.Equal(t, []string{"localhost:9092"}, cfg.Kafka.Brokers)
+		assert.Equal(t, "search-service-consumer", cfg.Kafka.GroupID)
+		assert.Equal(t, "search.indexing.requests", cfg.Kafka.Topic)
+	})
+
+	t.Run("エラー系: 不正な形式のファイル", func(t *testing.T) {
+		configYAML := `grpc: port: invalid`
+		tempDir := t.TempDir()
+		configPath := filepath.Join(tempDir, "config.yaml")
+		err := os.WriteFile(configPath, []byte(configYAML), 0600)
+		require.NoError(t, err)
+
+		_, err = Load(tempDir)
+		assert.Error(t, err)
+	})
+}
 ```
 ---
 ```go 
@@ -1696,9 +2685,67 @@ type Document struct {
 	Fields map[string]interface{}
 }
 
+// CreateIndexParams はインデックス作成時のパラメータを表します。
+type CreateIndexParams struct {
+	IndexName    string
+	Fields       []FieldDefinition
+	VectorConfig *VectorConfig
+}
+
+// FieldDefinition はインデックス内の単一フィールドの定義です。
+type FieldDefinition struct {
+	Name string
+	Type string
+}
+
+const (
+	// FieldTypeText は全文検索用の text フィールドを示します。
+	FieldTypeText = "text"
+	// FieldTypeKeyword は keyword フィールドを示します。
+	FieldTypeKeyword = "keyword"
+	// FieldTypeInteger は integer フィールドを示します。
+	FieldTypeInteger = "integer"
+	// FieldTypeFloat は float フィールドを示します。
+	FieldTypeFloat = "float"
+	// FieldTypeBoolean は boolean フィールドを示します。
+	FieldTypeBoolean = "boolean"
+	// FieldTypeDate は date フィールドを示します。
+	FieldTypeDate = "date"
+)
+
+// VectorConfig はベクトル検索用の設定を表します。
+type VectorConfig struct {
+	Dimension int
+	Distance  VectorDistance
+}
+
+// VectorDistance は Qdrant で利用可能な距離関数を示します。
+type VectorDistance string
+
+const (
+	// VectorDistanceCosine はコサイン距離を示します。
+	VectorDistanceCosine VectorDistance = "cosine"
+	// VectorDistanceEuclid はユークリッド距離を示します。
+	VectorDistanceEuclid VectorDistance = "euclid"
+	// VectorDistanceDot はドット積を示します。
+	VectorDistanceDot VectorDistance = "dot"
+)
+
+// IndexDocumentParams はドキュメントをインデックスする際のパラメータです。
+type IndexDocumentParams struct {
+	IndexName  string
+	DocumentID string
+	Fields     map[string]interface{}
+	Vector     []float32
+}
+
 // SearchRepositoryはデータストアへのアクセスを抽象化します。
 type SearchRepository interface {
 	KeywordSearch(ctx context.Context, indexName, query string) ([]Document, error)
+	VectorSearch(ctx context.Context, indexName string, vector []float32) ([]Document, error)
+	IndexDocument(ctx context.Context, params IndexDocumentParams) error
+	DeleteDocument(ctx context.Context, indexName, documentID string) error
+	CreateIndex(ctx context.Context, params CreateIndexParams) error
 }
 ```
 ---
@@ -1711,8 +2758,9 @@ import "context"
 
 // SearchParamsは検索のパラメータです。
 type SearchParams struct {
-	IndexName string
-	QueryText string
+	IndexName   string
+	QueryText   string
+	QueryVector []float32
 }
 
 // SearchResultはビジネスロジックの検索結果です。
@@ -1724,59 +2772,451 @@ type SearchResult struct {
 // SearchServiceはビジネスロジックのインターフェースです。
 type SearchService interface {
 	Search(ctx context.Context, params SearchParams) (*SearchResult, error)
+	IndexDocument(ctx context.Context, params IndexDocumentParams) error
+	DeleteDocument(ctx context.Context, indexName, documentID string) error
+	CreateIndex(ctx context.Context, params CreateIndexParams) error
 }
 ```
 ---
 ```go 
-# internal/repository/elasticsearch.go
-
-package repository
-
-// このファイルはelasticsearchリポジトリの実装用です。
-// PoCの段階ではまだ実装しません。
-```
----
-```go 
-# internal/repository/elasticsearch_poc.go
+# internal/repository/search_repository.go
 
 package repository
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"reflect"
+	"strings"
+
+	"github.com/elastic/go-elasticsearch/v9"
+	"github.com/elastic/go-elasticsearch/v9/typedapi/core/search"
+	"github.com/elastic/go-elasticsearch/v9/typedapi/types"
+	"github.com/elastic/go-elasticsearch/v9/typedapi/types/enums/result"
+	"github.com/qdrant/go-client/qdrant"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/takumi-1234/searchService/internal/port"
 )
 
-// elasticsearchPocRepository は SearchRepository のPoC向け実装です。
-type elasticsearchPocRepository struct{}
-
-// NewElasticsearchPocRepository は elasticsearchPocRepository の新しいインスタンスを生成します。
-func NewElasticsearchPocRepository() port.SearchRepository {
-	return &elasticsearchPocRepository{}
+// searchRepository は Elasticsearch と Qdrant の両方との通信を担当します。
+type searchRepository struct {
+	esClient          *elasticsearch.TypedClient
+	qdrantPoints      qdrant.PointsClient
+	qdrantCollections qdrant.CollectionsClient
 }
 
-// KeywordSearch はハードコードされた検索結果を返します。
-func (r *elasticsearchPocRepository) KeywordSearch(ctx context.Context, indexName, query string) ([]port.Document, error) {
-	// PoCのため、常に固定の正常なレスポンスを返す
-	return []port.Document{
-		{
-			ID:    "doc-123",
-			Score: 0.99,
-			Fields: map[string]interface{}{
-				"title": "PoC Document",
+// NewSearchRepository は新しい統合 searchRepository のインスタンスを生成します。
+func NewSearchRepository(es *elasticsearch.TypedClient, qdrantConn *grpc.ClientConn) port.SearchRepository {
+	return &searchRepository{
+		esClient:          es,
+		qdrantPoints:      qdrant.NewPointsClient(qdrantConn),
+		qdrantCollections: qdrant.NewCollectionsClient(qdrantConn),
+	}
+}
+
+// KeywordSearch は Elasticsearch を使用してキーワード検索を実行します。
+func (r *searchRepository) KeywordSearch(ctx context.Context, indexName, query string) ([]port.Document, error) {
+	req := &search.Request{
+		Query: &types.Query{
+			Match: map[string]types.MatchQuery{
+				"content": {Query: query},
 			},
 		},
-	}, nil
+	}
+
+	res, err := r.esClient.Search().Index(indexName).Request(req).Do(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("elasticsearch search request failed: %w", err)
+	}
+
+	documents := make([]port.Document, 0, len(res.Hits.Hits))
+	for _, hit := range res.Hits.Hits {
+		var fields map[string]interface{}
+		if err := json.Unmarshal(hit.Source_, &fields); err != nil {
+			log.Printf("warn: failed to unmarshal document source: %v", err)
+			continue
+		}
+
+		var score float32
+		if hit.Score_ != nil {
+			score = float32(*hit.Score_)
+		}
+
+		documents = append(documents, port.Document{
+			ID:     *hit.Id_,
+			Score:  score,
+			Fields: fields,
+		})
+	}
+
+	return documents, nil
 }
-```
----
-```go 
-# internal/repository/qdrant.go
 
-package repository
+// VectorSearch は Qdrant を使用してベクトル検索を実行します。
+func (r *searchRepository) VectorSearch(ctx context.Context, indexName string, vector []float32) ([]port.Document, error) {
+	req := &qdrant.SearchPoints{
+		CollectionName: indexName,
+		Vector:         vector,
+		Limit:          10,
+		WithPayload: &qdrant.WithPayloadSelector{
+			SelectorOptions: &qdrant.WithPayloadSelector_Enable{Enable: true},
+		},
+	}
 
-// このファイルはqdrantリポジトリの実装用です。
-// PoCの段階ではまだ実装しません。
+	res, err := r.qdrantPoints.Search(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("qdrant search request failed: %w", err)
+	}
+
+	documents := make([]port.Document, 0, len(res.GetResult()))
+	for _, hit := range res.GetResult() {
+		fields := make(map[string]interface{})
+		for k, v := range hit.GetPayload() {
+			fields[k] = valueFromQdrant(v)
+		}
+
+		var idStr string
+		if hit.GetId().GetNum() != 0 {
+			idStr = fmt.Sprintf("%d", hit.GetId().GetNum())
+		} else {
+			idStr = hit.GetId().GetUuid()
+		}
+
+		documents = append(documents, port.Document{
+			ID:     idStr,
+			Score:  hit.GetScore(),
+			Fields: fields,
+		})
+	}
+
+	return documents, nil
+}
+
+// IndexDocument はドキュメントをElasticsearchとQdrantに並行してインデックスします。
+func (r *searchRepository) IndexDocument(ctx context.Context, params port.IndexDocumentParams) error {
+	g, gCtx := errgroup.WithContext(ctx)
+
+	// Elasticsearchへのインデックス作成
+	g.Go(func() error {
+		res, err := r.esClient.Index(params.IndexName).Id(params.DocumentID).Request(params.Fields).Do(gCtx)
+		if err != nil {
+			return fmt.Errorf("failed to index document in elasticsearch: %w", err)
+		}
+		// 修正点: 文字列比較をenum定数比較に変更
+		if res.Result != result.Created && res.Result != result.Updated {
+			return fmt.Errorf("unexpected elasticsearch index result: %s", res.Result)
+		}
+		return nil
+	})
+
+	// QdrantへのUpsert
+	if len(params.Vector) > 0 {
+		vector := append([]float32(nil), params.Vector...)
+		g.Go(func() error {
+			payload, err := payloadToQdrant(params.Fields)
+			if err != nil {
+				return fmt.Errorf("failed to convert payload for qdrant: %w", err)
+			}
+
+			wait := true
+			_, err = r.qdrantPoints.Upsert(gCtx, &qdrant.UpsertPoints{
+				CollectionName: params.IndexName,
+				Wait:           &wait,
+				Points: []*qdrant.PointStruct{
+					{
+						Id:      &qdrant.PointId{PointIdOptions: &qdrant.PointId_Uuid{Uuid: params.DocumentID}},
+						Vectors: &qdrant.Vectors{VectorsOptions: &qdrant.Vectors_Vector{Vector: &qdrant.Vector{Data: vector}}},
+						Payload: payload,
+					},
+				},
+			})
+			if err != nil {
+				return fmt.Errorf("failed to upsert point to qdrant: %w", err)
+			}
+			return nil
+		})
+	}
+
+	return g.Wait()
+}
+
+// DeleteDocument はドキュメントをElasticsearchとQdrantから並行して削除します。
+func (r *searchRepository) DeleteDocument(ctx context.Context, indexName, documentID string) error {
+	g, gCtx := errgroup.WithContext(ctx)
+
+	// Elasticsearchからの削除
+	g.Go(func() error {
+		res, err := r.esClient.Delete(indexName, documentID).Do(gCtx)
+		if err != nil {
+			return fmt.Errorf("failed to delete document from elasticsearch: %w", err)
+		}
+		// 修正点: 文字列比較をenum定数比較に変更
+		if res.Result.Name != "deleted" && res.Result.Name != "not_found" {
+			return fmt.Errorf("unexpected elasticsearch delete result: %s", res.Result)
+		}
+		return nil
+	})
+
+	// Qdrantからの削除
+	g.Go(func() error {
+		wait := true
+		// 修正点: メソッド名を Delete に変更
+		_, err := r.qdrantPoints.Delete(gCtx, &qdrant.DeletePoints{
+			CollectionName: indexName,
+			Wait:           &wait,
+			Points: &qdrant.PointsSelector{
+				PointsSelectorOneOf: &qdrant.PointsSelector_Points{
+					Points: &qdrant.PointsIdsList{
+						Ids: []*qdrant.PointId{
+							{PointIdOptions: &qdrant.PointId_Uuid{Uuid: documentID}},
+						},
+					},
+				},
+			},
+		})
+		if err != nil {
+			if status.Code(err) == codes.NotFound {
+				return nil
+			}
+			return fmt.Errorf("failed to delete point from qdrant: %w", err)
+		}
+		return nil
+	})
+
+	return g.Wait()
+}
+
+// CreateIndex は Elasticsearch と Qdrant にインデックスを作成します。
+func (r *searchRepository) CreateIndex(ctx context.Context, params port.CreateIndexParams) error {
+	if params.IndexName == "" {
+		return fmt.Errorf("index name must not be empty")
+	}
+	if params.VectorConfig == nil {
+		return fmt.Errorf("vector config must not be nil")
+	}
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		return r.createElasticsearchIndex(gCtx, params)
+	})
+
+	g.Go(func() error {
+		return r.createQdrantCollection(gCtx, params)
+	})
+
+	return g.Wait()
+}
+
+func (r *searchRepository) createElasticsearchIndex(ctx context.Context, params port.CreateIndexParams) error {
+	properties := make(map[string]interface{}, len(params.Fields))
+	for _, field := range params.Fields {
+		fieldType, err := toElasticsearchFieldType(field.Type)
+		if err != nil {
+			return err
+		}
+		properties[field.Name] = map[string]interface{}{"type": fieldType}
+	}
+
+	createReq := r.esClient.Indices.Create(params.IndexName)
+	if len(properties) > 0 {
+		body := map[string]interface{}{
+			"mappings": map[string]interface{}{
+				"properties": properties,
+			},
+		}
+		payload, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("failed to marshal elasticsearch mappings: %w", err)
+		}
+		createReq = createReq.Raw(bytes.NewReader(payload))
+	}
+
+	res, err := createReq.Do(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create elasticsearch index: %w", err)
+	}
+	if !res.Acknowledged {
+		return fmt.Errorf("elasticsearch index creation not acknowledged")
+	}
+	return nil
+}
+
+func (r *searchRepository) createQdrantCollection(ctx context.Context, params port.CreateIndexParams) error {
+	vectorCfg := params.VectorConfig
+	if vectorCfg.Dimension <= 0 {
+		return fmt.Errorf("vector dimension must be positive")
+	}
+
+	distance, err := toQdrantDistance(vectorCfg.Distance)
+	if err != nil {
+		return err
+	}
+
+	_, err = r.qdrantCollections.Create(ctx, &qdrant.CreateCollection{
+		CollectionName: params.IndexName,
+		VectorsConfig: &qdrant.VectorsConfig{
+			Config: &qdrant.VectorsConfig_Params{
+				Params: &qdrant.VectorParams{
+					Size:     uint64(vectorCfg.Dimension),
+					Distance: distance,
+				},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create qdrant collection: %w", err)
+	}
+	return nil
+}
+
+func toElasticsearchFieldType(fieldType string) (string, error) {
+	switch normalized := strings.ToLower(fieldType); normalized {
+	case port.FieldTypeText:
+		return "text", nil
+	case port.FieldTypeKeyword:
+		return "keyword", nil
+	case port.FieldTypeInteger:
+		return "integer", nil
+	case port.FieldTypeFloat:
+		return "float", nil
+	case port.FieldTypeBoolean:
+		return "boolean", nil
+	case port.FieldTypeDate:
+		return "date", nil
+	default:
+		return "", fmt.Errorf("unsupported field type: %s", fieldType)
+	}
+}
+
+func toQdrantDistance(distance port.VectorDistance) (qdrant.Distance, error) {
+	switch distance {
+	case port.VectorDistanceCosine:
+		return qdrant.Distance_Cosine, nil
+	case port.VectorDistanceEuclid:
+		return qdrant.Distance_Euclid, nil
+	case port.VectorDistanceDot:
+		return qdrant.Distance_Dot, nil
+	default:
+		return qdrant.Distance_UnknownDistance, fmt.Errorf("unsupported vector distance: %s", distance)
+	}
+}
+
+// ... (valueFromQdrant, payloadToQdrant ヘルパー関数は変更なし)
+func valueFromQdrant(v *qdrant.Value) interface{} {
+	switch kind := v.GetKind().(type) {
+	case *qdrant.Value_NullValue:
+		return nil
+	case *qdrant.Value_DoubleValue:
+		return kind.DoubleValue
+	case *qdrant.Value_IntegerValue:
+		return kind.IntegerValue
+	case *qdrant.Value_StringValue:
+		return kind.StringValue
+	case *qdrant.Value_BoolValue:
+		return kind.BoolValue
+	case *qdrant.Value_StructValue:
+		m := make(map[string]interface{})
+		for k, sv := range kind.StructValue.GetFields() {
+			m[k] = valueFromQdrant(sv)
+		}
+		return m
+	case *qdrant.Value_ListValue:
+		l := make([]interface{}, 0, len(kind.ListValue.GetValues()))
+		for _, lv := range kind.ListValue.GetValues() {
+			l = append(l, valueFromQdrant(lv))
+		}
+		return l
+	default:
+		return nil
+	}
+}
+func payloadToQdrant(fields map[string]interface{}) (map[string]*qdrant.Value, error) {
+	payload := make(map[string]*qdrant.Value, len(fields))
+	for k, v := range fields {
+		qdrantValue, err := toQdrantValue(v)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert value for key '%s': %w", k, err)
+		}
+		payload[k] = qdrantValue
+	}
+	return payload, nil
+}
+func toQdrantValue(v interface{}) (*qdrant.Value, error) {
+	switch val := v.(type) {
+	case string:
+		return &qdrant.Value{Kind: &qdrant.Value_StringValue{StringValue: val}}, nil
+	case int:
+		return &qdrant.Value{Kind: &qdrant.Value_IntegerValue{IntegerValue: int64(val)}}, nil
+	case int64:
+		return &qdrant.Value{Kind: &qdrant.Value_IntegerValue{IntegerValue: val}}, nil
+	case float32:
+		return &qdrant.Value{Kind: &qdrant.Value_DoubleValue{DoubleValue: float64(val)}}, nil
+	case float64:
+		return &qdrant.Value{Kind: &qdrant.Value_DoubleValue{DoubleValue: val}}, nil
+	case bool:
+		return &qdrant.Value{Kind: &qdrant.Value_BoolValue{BoolValue: val}}, nil
+	case nil:
+		return &qdrant.Value{Kind: &qdrant.Value_NullValue{}}, nil
+	case map[string]interface{}:
+		payload := make(map[string]*qdrant.Value, len(val))
+		for key, nested := range val {
+			converted, err := toQdrantValue(nested)
+			if err != nil {
+				return nil, fmt.Errorf("failed to convert nested key '%s': %w", key, err)
+			}
+			payload[key] = converted
+		}
+		return &qdrant.Value{Kind: &qdrant.Value_StructValue{StructValue: &qdrant.Struct{Fields: payload}}}, nil
+	case []interface{}:
+		values := make([]*qdrant.Value, 0, len(val))
+		for idx, item := range val {
+			converted, err := toQdrantValue(item)
+			if err != nil {
+				return nil, fmt.Errorf("failed to convert list index %d: %w", idx, err)
+			}
+			values = append(values, converted)
+		}
+		return &qdrant.Value{Kind: &qdrant.Value_ListValue{ListValue: &qdrant.ListValue{Values: values}}}, nil
+	default:
+		rv := reflect.ValueOf(v)
+		switch rv.Kind() {
+		case reflect.Map:
+			if rv.Type().Key().Kind() != reflect.String {
+				return nil, fmt.Errorf("unsupported map key type %s for qdrant payload", rv.Type().Key())
+			}
+			payload := make(map[string]*qdrant.Value, rv.Len())
+			for _, key := range rv.MapKeys() {
+				converted, err := toQdrantValue(rv.MapIndex(key).Interface())
+				if err != nil {
+					return nil, fmt.Errorf("failed to convert nested key '%s': %w", key.String(), err)
+				}
+				payload[key.String()] = converted
+			}
+			return &qdrant.Value{Kind: &qdrant.Value_StructValue{StructValue: &qdrant.Struct{Fields: payload}}}, nil
+		case reflect.Slice, reflect.Array:
+			length := rv.Len()
+			values := make([]*qdrant.Value, 0, length)
+			for i := 0; i < length; i++ {
+				converted, err := toQdrantValue(rv.Index(i).Interface())
+				if err != nil {
+					return nil, fmt.Errorf("failed to convert list index %d: %w", i, err)
+				}
+				values = append(values, converted)
+			}
+			return &qdrant.Value{Kind: &qdrant.Value_ListValue{ListValue: &qdrant.ListValue{Values: values}}}, nil
+		default:
+			return nil, fmt.Errorf("unsupported type for qdrant payload: %T", v)
+		}
+	}
+}
 ```
 ---
 ```go 
@@ -1786,18 +3226,23 @@ package service
 
 import (
 	"context"
+	"fmt"
+	"sort"
+	"strings"
 
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/takumi-1234/searchService/internal/port"
 )
 
+// searchService は SearchRepository に依存する。
 type searchService struct {
 	repo   port.SearchRepository
 	logger *zap.Logger
 }
 
-// NewSearchService は searchService の新しいインスタンスを生成します。
+// NewSearchService は searchService の新しいインスタンスを生成する。
 func NewSearchService(repo port.SearchRepository, logger *zap.Logger) port.SearchService {
 	return &searchService{
 		repo:   repo,
@@ -1805,27 +3250,139 @@ func NewSearchService(repo port.SearchRepository, logger *zap.Logger) port.Searc
 	}
 }
 
-// Search はドキュメントを検索するビジネスロジックを実行します。
+// CreateIndex は新しい検索インデックスを作成します。
+func (s *searchService) CreateIndex(ctx context.Context, params port.CreateIndexParams) error {
+	if err := validateCreateIndexParams(params); err != nil {
+		return err
+	}
+
+	s.logger.Info("creating index",
+		zap.String("index_name", params.IndexName),
+		zap.Int("field_count", len(params.Fields)),
+		zap.Int("vector_dimension", params.VectorConfig.Dimension),
+		zap.String("vector_distance", string(params.VectorConfig.Distance)),
+	)
+
+	if err := s.repo.CreateIndex(ctx, params); err != nil {
+		s.logger.Error("failed to create index", zap.String("index_name", params.IndexName), zap.Error(err))
+		return err
+	}
+
+	s.logger.Info("index created successfully", zap.String("index_name", params.IndexName))
+	return nil
+}
+
+// IndexDocument はドキュメントをインデックスに追加または更新します。
+func (s *searchService) IndexDocument(ctx context.Context, params port.IndexDocumentParams) error {
+	return s.repo.IndexDocument(ctx, params)
+}
+
+func (s *searchService) DeleteDocument(ctx context.Context, indexName, documentID string) error {
+	return s.repo.DeleteDocument(ctx, indexName, documentID)
+}
+
+// Search はキーワード検索とベクトル検索を並列に実行し、スコアを加算してマージ、スコア降順で返却する。
 func (s *searchService) Search(ctx context.Context, params port.SearchParams) (*port.SearchResult, error) {
 	s.logger.Info("starting search process",
 		zap.String("index_name", params.IndexName),
 		zap.String("query", params.QueryText),
 	)
 
-	documents, err := s.repo.KeywordSearch(ctx, params.IndexName, params.QueryText)
-	if err != nil {
-		s.logger.Error("failed to perform keyword search in repository", zap.Error(err))
-		return nil, err // エラーは適切にラップされるべきだが、ここではそのまま返す
+	var (
+		keywordRes []port.Document
+		vectorRes  []port.Document
+	)
+
+	g, ctx := errgroup.WithContext(ctx)
+
+	// キーワード検索は常に呼ぶ
+	g.Go(func() error {
+		docs, err := s.repo.KeywordSearch(ctx, params.IndexName, params.QueryText)
+		if err != nil {
+			s.logger.Error("keyword search failed", zap.Error(err))
+			return err
+		}
+		if docs == nil {
+			keywordRes = []port.Document{}
+		} else {
+			keywordRes = docs
+		}
+		return nil
+	})
+
+	// VectorSearch は QueryVector が与えられている場合のみ並列で呼ぶ
+	if len(params.QueryVector) > 0 {
+		// capture vector
+		vector := params.QueryVector
+		g.Go(func() error {
+			docs, err := s.repo.VectorSearch(ctx, params.IndexName, vector)
+			if err != nil {
+				s.logger.Error("vector search failed", zap.Error(err))
+				return err
+			}
+			if docs == nil {
+				vectorRes = []port.Document{}
+			} else {
+				vectorRes = docs
+			}
+			return nil
+		})
+	} else {
+		// ensure zero value rather than nil for later processing
+		vectorRes = []port.Document{}
 	}
+
+	// Wait for both goroutines (or the single one + optional vector) to finish
+	if err := g.Wait(); err != nil {
+		// エラーはそのまま返す（呼び出し側でラップする場合は変更可）
+		return nil, err
+	}
+
+	// スコア統合ロジック
+	merged := make(map[string]port.Document)
+
+	// まずキーワード結果を入れる
+	for _, d := range keywordRes {
+		// make a copy to avoid aliasing
+		merged[d.ID] = port.Document{
+			ID:     d.ID,
+			Score:  d.Score,
+			Fields: d.Fields,
+		}
+	}
+
+	// ベクトル結果をマージ（存在すればスコアを加算、存在しなければ新規追加）
+	for _, vd := range vectorRes {
+		if existing, ok := merged[vd.ID]; ok {
+			// スコアを加算。Fields は既存（キーワード優先）に残すが、無ければベクトル側を使う。
+			existing.Score = existing.Score + vd.Score
+			if len(existing.Fields) == 0 {
+				existing.Fields = vd.Fields
+			}
+			merged[vd.ID] = existing
+		} else {
+			merged[vd.ID] = port.Document{
+				ID:     vd.ID,
+				Score:  vd.Score,
+				Fields: vd.Fields,
+			}
+		}
+	}
+
+	// マップをスライスに変換してソート
+	finalDocs := make([]port.Document, 0, len(merged))
+	for _, d := range merged {
+		finalDocs = append(finalDocs, d)
+	}
+
+	// スコア降順ソート（高いものが先）
+	sort.Slice(finalDocs, func(i, j int) bool {
+		return finalDocs[i].Score > finalDocs[j].Score
+	})
 
 	result := &port.SearchResult{
-		TotalCount: int64(len(documents)),
-		Documents:  make([]port.Document, len(documents)),
-	}
-
-	// port.Document (repository) を port.Document (service) に変換
-	for i, doc := range documents {
-		result.Documents[i] = port.Document(doc)
+		TotalCount: int64(len(finalDocs)),
+		Documents:  finalDocs,
 	}
 
 	s.logger.Info("search process finished successfully",
@@ -1833,6 +3390,59 @@ func (s *searchService) Search(ctx context.Context, params port.SearchParams) (*
 	)
 
 	return result, nil
+}
+
+func validateCreateIndexParams(params port.CreateIndexParams) error {
+	if params.IndexName == "" {
+		return fmt.Errorf("index name is required")
+	}
+	if params.VectorConfig == nil {
+		return fmt.Errorf("vector config is required")
+	}
+	if params.VectorConfig.Dimension <= 0 {
+		return fmt.Errorf("vector dimension must be positive")
+	}
+	if !isValidVectorDistance(params.VectorConfig.Distance) {
+		return fmt.Errorf("unsupported vector distance: %s", params.VectorConfig.Distance)
+	}
+	seen := make(map[string]struct{}, len(params.Fields))
+	for _, field := range params.Fields {
+		if field.Name == "" {
+			return fmt.Errorf("field name is required")
+		}
+		key := strings.ToLower(field.Name)
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("duplicate field name: %s", field.Name)
+		}
+		if !isValidFieldType(field.Type) {
+			return fmt.Errorf("unsupported field type: %s", field.Type)
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+func isValidFieldType(fieldType string) bool {
+	switch strings.ToLower(fieldType) {
+	case port.FieldTypeText,
+		port.FieldTypeKeyword,
+		port.FieldTypeInteger,
+		port.FieldTypeFloat,
+		port.FieldTypeBoolean,
+		port.FieldTypeDate:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidVectorDistance(distance port.VectorDistance) bool {
+	switch distance {
+	case port.VectorDistanceCosine, port.VectorDistanceEuclid, port.VectorDistanceDot:
+		return true
+	default:
+		return false
+	}
 }
 ```
 ---
@@ -1853,7 +3463,7 @@ import (
 	"github.com/takumi-1234/searchService/internal/port"
 )
 
-// MockSearchRepository は port.SearchRepository のモックです。
+// MockSearchRepository は port.SearchRepository のモック。
 type MockSearchRepository struct {
 	mock.Mock
 }
@@ -1866,21 +3476,105 @@ func (m *MockSearchRepository) KeywordSearch(ctx context.Context, indexName, que
 	return args.Get(0).([]port.Document), args.Error(1)
 }
 
+func (m *MockSearchRepository) VectorSearch(ctx context.Context, indexName string, vector []float32) ([]port.Document, error) {
+	args := m.Called(ctx, indexName, vector)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]port.Document), args.Error(1)
+}
+
+func (m *MockSearchRepository) DeleteDocument(ctx context.Context, indexName, documentID string) error {
+	args := m.Called(ctx, indexName, documentID)
+	return args.Error(0)
+}
+
+func (m *MockSearchRepository) IndexDocument(ctx context.Context, params port.IndexDocumentParams) error {
+	args := m.Called(ctx, params)
+	return args.Error(0)
+}
+
+func (m *MockSearchRepository) CreateIndex(ctx context.Context, params port.CreateIndexParams) error {
+	args := m.Called(ctx, params)
+	return args.Error(0)
+}
+
+func TestSearchService_CreateIndex(t *testing.T) {
+	logger := zap.NewNop()
+	ctx := context.Background()
+
+	validParams := port.CreateIndexParams{
+		IndexName: "test-index",
+		Fields: []port.FieldDefinition{
+			{Name: "content", Type: port.FieldTypeText},
+			{Name: "published_at", Type: port.FieldTypeDate},
+		},
+		VectorConfig: &port.VectorConfig{
+			Dimension: 3,
+			Distance:  port.VectorDistanceCosine,
+		},
+	}
+
+	t.Run("success", func(t *testing.T) {
+		mockRepo := new(MockSearchRepository)
+		service := NewSearchService(mockRepo, logger)
+
+		mockRepo.On("CreateIndex", ctx, validParams).Return(nil).Once()
+
+		err := service.CreateIndex(ctx, validParams)
+		assert.NoError(t, err)
+
+		mockRepo.AssertExpectations(t)
+	})
+
+	t.Run("validation error prevents repository call", func(t *testing.T) {
+		mockRepo := new(MockSearchRepository)
+		service := NewSearchService(mockRepo, logger)
+
+		invalidParams := port.CreateIndexParams{
+			IndexName: "",
+			VectorConfig: &port.VectorConfig{
+				Dimension: 3,
+				Distance:  port.VectorDistanceCosine,
+			},
+		}
+
+		err := service.CreateIndex(ctx, invalidParams)
+		assert.Error(t, err)
+
+		mockRepo.AssertNotCalled(t, "CreateIndex", mock.Anything, mock.Anything)
+	})
+
+	t.Run("repository error is returned", func(t *testing.T) {
+		mockRepo := new(MockSearchRepository)
+		service := NewSearchService(mockRepo, logger)
+
+		expectedErr := errors.New("repo failure")
+		mockRepo.On("CreateIndex", ctx, validParams).Return(expectedErr).Once()
+
+		err := service.CreateIndex(ctx, validParams)
+		assert.ErrorIs(t, err, expectedErr)
+
+		mockRepo.AssertExpectations(t)
+	})
+}
+
 func TestSearchService_Search(t *testing.T) {
 	logger := zap.NewNop()
 	ctx := context.Background()
 
-	t.Run("正常系: 検索が成功する", func(t *testing.T) {
+	t.Run("キーワード検索のみ実行されるケース", func(t *testing.T) {
 		mockRepo := new(MockSearchRepository)
 		service := NewSearchService(mockRepo, logger)
 
 		repoDocs := []port.Document{
 			{ID: "doc-1", Score: 0.9, Fields: map[string]interface{}{"title": "Test"}},
 		}
-		params := port.SearchParams{IndexName: "test-index", QueryText: "test query"}
+		params := port.SearchParams{IndexName: "test-index", QueryText: "test query", QueryVector: nil}
 
-		mockRepo.On("KeywordSearch", ctx, params.IndexName, params.QueryText).Return(repoDocs, nil).Once()
-
+		mockRepo.On("KeywordSearch", mock.Anything, params.IndexName, params.QueryText).Return(repoDocs, nil).Once()
+		// VectorSearch は呼ばれないことを確認するため、呼ばれたらテスト失敗にする（Times(0) は設定できないため AssertNotCalled を使用）
+		// 実行
 		result, err := service.Search(ctx, params)
 
 		assert.NoError(t, err)
@@ -1888,22 +3582,81 @@ func TestSearchService_Search(t *testing.T) {
 		assert.Equal(t, int64(1), result.TotalCount)
 		assert.Equal(t, "doc-1", result.Documents[0].ID)
 		mockRepo.AssertExpectations(t)
+		mockRepo.AssertNotCalled(t, "VectorSearch", mock.Anything, mock.Anything, mock.Anything)
 	})
 
-	t.Run("エラー系: リポジトリがエラーを返す", func(t *testing.T) {
+	t.Run("キーワード検索とベクトル検索の両方が実行され、正しくマージ・ソートされるケース", func(t *testing.T) {
 		mockRepo := new(MockSearchRepository)
 		service := NewSearchService(mockRepo, logger)
 
-		expectedErr := errors.New("repository error")
-		params := port.SearchParams{IndexName: "test-index", QueryText: "error query"}
+		// キーワード側の結果
+		keywordDocs := []port.Document{
+			{ID: "A", Score: 0.6, Fields: map[string]interface{}{"title": "A-key"}},
+			{ID: "B", Score: 0.4, Fields: map[string]interface{}{"title": "B-key"}},
+		}
+		// ベクトル側の結果（A が重複、C は新規）
+		vectorDocs := []port.Document{
+			{ID: "A", Score: 0.8, Fields: map[string]interface{}{"title": "A-vec"}},
+			{ID: "C", Score: 0.7, Fields: map[string]interface{}{"title": "C-vec"}},
+		}
 
-		mockRepo.On("KeywordSearch", ctx, params.IndexName, params.QueryText).Return(nil, expectedErr).Once()
+		params := port.SearchParams{
+			IndexName:   "test-index",
+			QueryText:   "hybrid query",
+			QueryVector: []float32{0.1, 0.2},
+		}
+
+		mockRepo.On("KeywordSearch", mock.Anything, params.IndexName, params.QueryText).Return(keywordDocs, nil).Once()
+		mockRepo.On("VectorSearch", mock.Anything, params.IndexName, params.QueryVector).Return(vectorDocs, nil).Once()
 
 		result, err := service.Search(ctx, params)
+		assert.NoError(t, err)
+		if assert.NotNil(t, result) {
+			assert.Equal(t, int64(3), result.TotalCount)
 
+			// 期待される最終スコア:
+			// A: 0.6 + 0.8 = 1.4
+			// B: 0.4
+			// C: 0.7
+			// ソート順: A (1.4), C (0.7), B (0.4)
+
+			// IDs in order:
+			assert.Equal(t, "A", result.Documents[0].ID)
+			assert.Equal(t, "C", result.Documents[1].ID)
+			assert.Equal(t, "B", result.Documents[2].ID)
+
+			// Scores
+			assert.InDelta(t, 1.4, result.Documents[0].Score, 1e-6)
+			assert.InDelta(t, 0.7, result.Documents[1].Score, 1e-6)
+			assert.InDelta(t, 0.4, result.Documents[2].Score, 1e-6)
+		}
+
+		mockRepo.AssertExpectations(t)
+	})
+
+	t.Run("エラー系: 片方の検索でエラーが発生するケース", func(t *testing.T) {
+		mockRepo := new(MockSearchRepository)
+		service := NewSearchService(mockRepo, logger)
+
+		keywordDocs := []port.Document{
+			{ID: "doc-1", Score: 0.5, Fields: map[string]interface{}{"title": "Test"}},
+		}
+		expectedErr := errors.New("vector search failed")
+
+		params := port.SearchParams{
+			IndexName:   "test-index",
+			QueryText:   "will error",
+			QueryVector: []float32{0.1},
+		}
+
+		mockRepo.On("KeywordSearch", mock.Anything, params.IndexName, params.QueryText).Return(keywordDocs, nil).Once()
+		mockRepo.On("VectorSearch", mock.Anything, params.IndexName, params.QueryVector).Return(nil, expectedErr).Once()
+
+		result, err := service.Search(ctx, params)
 		assert.Error(t, err)
 		assert.Nil(t, result)
 		assert.Equal(t, expectedErr, err)
+
 		mockRepo.AssertExpectations(t)
 	})
 }
@@ -1926,9 +3679,549 @@ package e2e
 ```go 
 # tests/integration/search_test.go
 
+//go:build integration
+
 package integration
 
-// このファイルはelasticsearchリポジトリの実装用です。
-// PoCの段階ではまだ実装しません。
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/go-connections/nat"
+	"github.com/elastic/go-elasticsearch/v9"
+	"github.com/elastic/go-elasticsearch/v9/typedapi/types/enums/refresh"
+	"github.com/qdrant/go-client/qdrant"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	searchv1 "github.com/takumi-1234/searchService/gen/proto/search/v1"
+	grpc_adapter "github.com/takumi-1234/searchService/internal/adapter/grpc"
+	message_adapter "github.com/takumi-1234/searchService/internal/adapter/message"
+	"github.com/takumi-1234/searchService/internal/repository"
+	"github.com/takumi-1234/searchService/internal/service"
+)
+
+// setupElasticsearch は Elasticsearch の testcontainer をセットアップします。
+func setupElasticsearch(ctx context.Context) (*elasticsearch.TypedClient, func(), error) {
+	req := testcontainers.ContainerRequest{
+		Image:        "docker.elastic.co/elasticsearch/elasticsearch:9.1.0",
+		ExposedPorts: []string{"9200/tcp"},
+		Env: map[string]string{
+			"discovery.type":         "single-node",
+			"xpack.security.enabled": "false",
+		},
+		WaitingFor: wait.ForHTTP("/").WithPort("9200").WithStatusCodeMatcher(func(status int) bool { return status == http.StatusOK }).WithStartupTimeout(120 * time.Second),
+	}
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{ContainerRequest: req, Started: true})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to start elasticsearch container: %w", err)
+	}
+
+	cleanup := func() {
+		if err := container.Terminate(ctx); err != nil {
+			log.Fatalf("failed to terminate elasticsearch container: %v", err)
+		}
+	}
+
+	endpoint, err := container.Endpoint(ctx, "http")
+	if err != nil {
+		return nil, cleanup, fmt.Errorf("failed to get elasticsearch endpoint: %w", err)
+	}
+
+	esClient, err := elasticsearch.NewTypedClient(elasticsearch.Config{Addresses: []string{endpoint}})
+	if err != nil {
+		return nil, cleanup, fmt.Errorf("failed to create elasticsearch client: %w", err)
+	}
+
+	return esClient, cleanup, nil
+}
+
+// setupQdrant は Qdrant の testcontainer をセットアップします。
+func setupQdrant(ctx context.Context) (*grpc.ClientConn, func(), error) {
+	req := testcontainers.ContainerRequest{
+		Image:        "qdrant/qdrant:latest",
+		ExposedPorts: []string{"6334/tcp"}, // Qdrant の gRPC ポート
+		WaitingFor:   wait.ForLog("Actix runtime found").WithStartupTimeout(60 * time.Second),
+	}
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{ContainerRequest: req, Started: true})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to start qdrant container: %w", err)
+	}
+
+	cleanup := func() {
+		if err := container.Terminate(ctx); err != nil {
+			log.Fatalf("failed to terminate qdrant container: %v", err)
+		}
+	}
+
+	// gRPCエンドポイントを取得
+	port, err := container.MappedPort(ctx, "6334")
+	if err != nil {
+		return nil, cleanup, fmt.Errorf("failed to get qdrant mapped port: %w", err)
+	}
+	endpoint := fmt.Sprintf("localhost:%s", port.Port())
+
+	conn, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, cleanup, fmt.Errorf("failed to connect to qdrant: %w", err)
+	}
+	return conn, cleanup, nil
+}
+
+// getFreePort はローカルホスト上の空きポートを取得します。
+func getFreePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+
+	addr, ok := l.Addr().(*net.TCPAddr)
+	if !ok {
+		return 0, fmt.Errorf("failed to assert listener address as *net.TCPAddr")
+	}
+	return addr.Port, nil
+}
+
+// setupKafka は Kafka (および必要な Zookeeper) の testcontainer をセットアップします。
+func setupKafka(ctx context.Context) (string, func(), error) {
+	const (
+		containerKafkaPortExternal = "29092/tcp"
+		containerKafkaPortInternal = "9092/tcp"
+		containerZkPort            = "2181/tcp"
+	)
+
+	networkName := fmt.Sprintf("kafka-net-%d", time.Now().UnixNano())
+	network, err := testcontainers.GenericNetwork(ctx, testcontainers.GenericNetworkRequest{
+		NetworkRequest: testcontainers.NetworkRequest{
+			Name:   networkName,
+			Driver: "bridge",
+		},
+	})
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create network: %w", err)
+	}
+
+	kafkaHostPort, err := getFreePort()
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to get free port for kafka: %w", err)
+	}
+
+	// Zookeeper コンテナの起動
+	zkReq := testcontainers.ContainerRequest{
+		Image: "confluentinc/cp-zookeeper:7.6.1",
+		Env: map[string]string{
+			"ZOOKEEPER_CLIENT_PORT": "2181",
+			"ZOOKEEPER_TICK_TIME":   "2000",
+		},
+		Networks:       []string{networkName},
+		NetworkAliases: map[string][]string{networkName: {"zookeeper"}},
+		ExposedPorts:   []string{containerZkPort},
+		WaitingFor:     wait.ForListeningPort(containerZkPort).WithStartupTimeout(120 * time.Second),
+	}
+	zkContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{ContainerRequest: zkReq, Started: true})
+	if err != nil {
+		network.Remove(ctx) //nolint:errcheck // best effort cleanup
+		return "", nil, fmt.Errorf("failed to start zookeeper container: %w", err)
+	}
+
+	// Kafka コンテナの起動
+	kafkaReq := testcontainers.ContainerRequest{
+		Image: "confluentinc/cp-kafka:7.6.1",
+		Env: map[string]string{
+			"KAFKA_BROKER_ID":                                "1",
+			"KAFKA_ZOOKEEPER_CONNECT":                        "zookeeper:2181",
+			"KAFKA_LISTENER_SECURITY_PROTOCOL_MAP":           "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT",
+			"KAFKA_LISTENERS":                                "PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092",
+			"KAFKA_ADVERTISED_LISTENERS":                     fmt.Sprintf("PLAINTEXT://kafka:9092,PLAINTEXT_HOST://127.0.0.1:%d", kafkaHostPort),
+			"KAFKA_INTER_BROKER_LISTENER_NAME":               "PLAINTEXT",
+			"KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR":         "1",
+			"KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR": "1",
+			"KAFKA_TRANSACTION_STATE_LOG_MIN_ISR":            "1",
+			"KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS":         "0",
+			"KAFKA_AUTO_CREATE_TOPICS_ENABLE":                "true",
+			"KAFKA_HEAP_OPTS":                                "-Xms256m -Xmx256m",
+		},
+		ExposedPorts:   []string{containerKafkaPortExternal, containerKafkaPortInternal},
+		Networks:       []string{networkName},
+		NetworkAliases: map[string][]string{networkName: {"kafka"}},
+		WaitingFor: wait.ForAll(
+			wait.ForListeningPort(containerKafkaPortInternal),
+			wait.ForListeningPort(containerKafkaPortExternal),
+		).WithStartupTimeout(180 * time.Second),
+		HostConfigModifier: func(hc *container.HostConfig) {
+			if hc.PortBindings == nil {
+				hc.PortBindings = nat.PortMap{}
+			}
+			internalPort := nat.Port(containerKafkaPortInternal)
+			if _, ok := hc.PortBindings[internalPort]; !ok {
+				hc.PortBindings[internalPort] = []nat.PortBinding{
+					{
+						HostIP:   "0.0.0.0",
+						HostPort: "0",
+					},
+				}
+			}
+			externalPort := nat.Port(containerKafkaPortExternal)
+			hc.PortBindings[externalPort] = []nat.PortBinding{
+				{
+					HostIP:   "127.0.0.1",
+					HostPort: strconv.Itoa(kafkaHostPort),
+				},
+			}
+		},
+	}
+
+	kafkaContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{ContainerRequest: kafkaReq, Started: true})
+	if err != nil {
+		_ = zkContainer.Terminate(ctx)
+		network.Remove(ctx) //nolint:errcheck // best effort cleanup
+		return "", nil, fmt.Errorf("failed to start kafka container: %w", err)
+	}
+
+	cleanup := func() {
+		if err := kafkaContainer.Terminate(ctx); err != nil {
+			log.Printf("failed to terminate kafka container: %v", err)
+		}
+		if err := zkContainer.Terminate(ctx); err != nil {
+			log.Printf("failed to terminate zookeeper container: %v", err)
+		}
+		if err := network.Remove(ctx); err != nil {
+			log.Printf("failed to remove test network: %v", err)
+		}
+	}
+
+	return fmt.Sprintf("127.0.0.1:%d", kafkaHostPort), cleanup, nil
+}
+
+// startTestGRPCServer はテスト用のgRPCサーバーを起動します。
+func startTestGRPCServer(t *testing.T, esClient *elasticsearch.TypedClient, qdrantConn *grpc.ClientConn) (string, func()) {
+	t.Helper()
+	repo := repository.NewSearchRepository(esClient, qdrantConn)
+	svc := service.NewSearchService(repo, zap.NewNop())
+	grpcSrv := grpc_adapter.NewServer(svc, zap.NewNop())
+
+	lis, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+
+	server := grpc.NewServer()
+	searchv1.RegisterSearchServiceServer(server, grpcSrv)
+
+	go func() {
+		if err := server.Serve(lis); err != nil && err != grpc.ErrServerStopped {
+			log.Printf("gRPC server error during test: %v", err)
+		}
+	}()
+
+	return lis.Addr().String(), func() { server.GracefulStop() }
+}
+
+func TestCreateIndex_Integration(t *testing.T) {
+	ctx := context.Background()
+
+	esClient, esCleanup, err := setupElasticsearch(ctx)
+	require.NoError(t, err, "failed to setup elasticsearch")
+	defer esCleanup()
+
+	qdrantConn, qdrantCleanup, err := setupQdrant(ctx)
+	require.NoError(t, err, "failed to setup qdrant")
+	defer qdrantCleanup()
+
+	grpcAddr, grpcCleanup := startTestGRPCServer(t, esClient, qdrantConn)
+	defer grpcCleanup()
+
+	conn, err := grpc.NewClient(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	defer conn.Close()
+	client := searchv1.NewSearchServiceClient(conn)
+
+	indexName := fmt.Sprintf("create-index-test-%d", time.Now().UnixNano())
+	req := &searchv1.CreateIndexRequest{
+		IndexName: indexName,
+		Schema: &searchv1.IndexSchema{
+			Fields: []*searchv1.FieldDefinition{
+				{Name: "content", Type: searchv1.FieldDefinition_FIELD_TYPE_TEXT},
+				{Name: "category", Type: searchv1.FieldDefinition_FIELD_TYPE_KEYWORD},
+			},
+			VectorConfig: &searchv1.VectorConfig{
+				Dimension: 3,
+				Distance:  searchv1.VectorConfig_DISTANCE_COSINE,
+			},
+		},
+	}
+
+	res, err := client.CreateIndex(ctx, req)
+	require.NoError(t, err, "CreateIndex RPC failed")
+	require.NotNil(t, res)
+	assert.True(t, res.GetSuccess())
+
+	exists, err := esClient.Indices.Exists(indexName).Do(ctx)
+	require.NoError(t, err, "failed to check elasticsearch index existence")
+	assert.True(t, exists, "elasticsearch index should exist after CreateIndex")
+
+	collectionsClient := qdrant.NewCollectionsClient(qdrantConn)
+	info, err := collectionsClient.Get(ctx, &qdrant.GetCollectionInfoRequest{CollectionName: indexName})
+	require.NoError(t, err, "failed to get qdrant collection info")
+	require.NotNil(t, info.GetResult())
+
+	collectionConfig := info.GetResult().GetConfig()
+	require.NotNil(t, collectionConfig, "collection config must not be nil")
+
+	params := collectionConfig.GetParams()
+	require.NotNil(t, params, "collection params must not be nil")
+
+	vectorsConfig := params.GetVectorsConfig()
+	require.NotNil(t, vectorsConfig, "vectors config must not be nil")
+
+	vectorParams := vectorsConfig.GetParams()
+	require.NotNil(t, vectorParams, "vector params must not be nil")
+	assert.EqualValues(t, 3, vectorParams.GetSize())
+	assert.Equal(t, qdrant.Distance_Cosine, vectorParams.GetDistance())
+}
+
+// TestSearchDocuments_HybridSearch_Integration はハイブリッド検索の統合テストです。
+func TestSearchDocuments_HybridSearch_Integration(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. 外部サービス(Elasticsearch, Qdrant)をセットアップ
+	esClient, esCleanup, err := setupElasticsearch(ctx)
+	require.NoError(t, err, "failed to setup elasticsearch")
+	defer esCleanup()
+
+	qdrantConn, qdrantCleanup, err := setupQdrant(ctx)
+	require.NoError(t, err, "failed to setup qdrant")
+	defer qdrantCleanup()
+
+	// 2. テスト用gRPCサーバーを起動
+	grpcAddr, grpcCleanup := startTestGRPCServer(t, esClient, qdrantConn)
+	defer grpcCleanup()
+
+	// 3. テストデータを準備
+	indexName := "hybrid-search-test-index"
+	vectorA := []float32{0.1, 0.2, 0.8} // DocAのベクトル
+	vectorC := []float32{0.1, 0.2, 0.7} // DocCのベクトル (Aに近い)
+
+	docAID := "11111111-1111-1111-1111-111111111111"
+	docBID := "22222222-2222-2222-2222-222222222222"
+	docCID := "33333333-3333-3333-3333-333333333333"
+
+	// 4. データを各DBに投入
+	// 4a. Elasticsearch: DocAとDocBを投入
+	type esDoc struct {
+		Content string `json:"content"`
+	}
+	_, err = esClient.Index(indexName).Id(docAID).Request(esDoc{Content: "This is a document about hybrid."}).Do(ctx)
+	require.NoError(t, err)
+	_, err = esClient.Index(indexName).Id(docBID).Request(esDoc{Content: "A document focused on search."}).Refresh(refresh.Waitfor).Do(ctx)
+	require.NoError(t, err)
+
+	// 4b. Qdrant: DocAとDocCを投入
+	qCollectionsClient := qdrant.NewCollectionsClient(qdrantConn)
+	_, err = qCollectionsClient.Create(ctx, &qdrant.CreateCollection{
+		CollectionName: indexName,
+		VectorsConfig: &qdrant.VectorsConfig{Config: &qdrant.VectorsConfig_Params{
+			Params: &qdrant.VectorParams{Size: 3, Distance: qdrant.Distance_Cosine},
+		}},
+	})
+	if err != nil && !assert.Contains(t, err.Error(), "already exists") {
+		require.NoError(t, err, "failed to create qdrant collection")
+	}
+
+	qPointsClient := qdrant.NewPointsClient(qdrantConn)
+	waitUpsert := true
+	_, err = qPointsClient.Upsert(ctx, &qdrant.UpsertPoints{
+		CollectionName: indexName,
+		Wait:           &waitUpsert,
+		Points: []*qdrant.PointStruct{
+			{Id: &qdrant.PointId{PointIdOptions: &qdrant.PointId_Uuid{Uuid: docAID}}, Vectors: &qdrant.Vectors{VectorsOptions: &qdrant.Vectors_Vector{Vector: &qdrant.Vector{Data: vectorA}}}},
+			{Id: &qdrant.PointId{PointIdOptions: &qdrant.PointId_Uuid{Uuid: docCID}}, Vectors: &qdrant.Vectors{VectorsOptions: &qdrant.Vectors_Vector{Vector: &qdrant.Vector{Data: vectorC}}}},
+		},
+	})
+	require.NoError(t, err, "failed to upsert points to qdrant")
+
+	// 5. gRPCクライアントを作成してハイブリッド検索を実行
+	conn, err := grpc.NewClient(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	defer conn.Close()
+	client := searchv1.NewSearchServiceClient(conn)
+
+	req := &searchv1.SearchDocumentsRequest{
+		IndexName:   indexName,
+		QueryText:   "hybrid search", // "hybrid"はDocAに、"search"はDocBにマッチするはず
+		QueryVector: vectorA,         // DocAとDocCにマッチするはず
+	}
+	res, err := client.SearchDocuments(ctx, req)
+
+	// 6. レスポンスを検証
+	require.NoError(t, err, "SearchDocuments RPC failed")
+	require.NotNil(t, res)
+	require.Len(t, res.Results, 3, "should find three documents in total (A, B, C)")
+
+	// DocAがキーワードとベクトルの両方でヒットするため、スコアが最も高くなるはず
+	assert.Equal(t, docAID, res.Results[0].DocumentId, "Doc A should have the highest score and be the first result")
+
+	// 残りのドキュメントのスコアより高いことを確認
+	assert.True(t, res.Results[0].Score > res.Results[1].Score, "Doc A score should be greater than the second result")
+	assert.True(t, res.Results[0].Score > res.Results[2].Score, "Doc A score should be greater than the third result")
+
+	// DocBとDocCが結果に含まれていることを確認（順序は問わない）
+	foundIDs := make(map[string]bool)
+	for _, r := range res.Results {
+		foundIDs[r.DocumentId] = true
+	}
+	assert.True(t, foundIDs[docBID], "Doc B should be in the results")
+	assert.True(t, foundIDs[docCID], "Doc C should be in the results")
+}
+
+// TestKafkaIndexing_Integration は Kafka コンシューマを介した非同期インデックス処理の統合テストです。
+func TestKafkaIndexing_Integration(t *testing.T) {
+	ctx := context.Background()
+
+	// 外部依存のセットアップ
+	esClient, esCleanup, err := setupElasticsearch(ctx)
+	require.NoError(t, err, "failed to setup elasticsearch")
+	defer esCleanup()
+
+	qdrantConn, qdrantCleanup, err := setupQdrant(ctx)
+	require.NoError(t, err, "failed to setup qdrant")
+	defer qdrantCleanup()
+
+	kafkaBootstrap, kafkaCleanup, err := setupKafka(ctx)
+	require.NoError(t, err, "failed to setup kafka")
+	defer kafkaCleanup()
+
+	// サービスの初期化
+	logger := zap.NewNop()
+	repo := repository.NewSearchRepository(esClient, qdrantConn)
+	svc := service.NewSearchService(repo, logger)
+
+	topic := "search.indexing.requests"
+	groupID := fmt.Sprintf("search-service-integration-%d", time.Now().UnixNano())
+
+	consumer, err := kafka.NewConsumer(&kafka.ConfigMap{
+		"bootstrap.servers": kafkaBootstrap,
+		"group.id":          groupID,
+		"auto.offset.reset": "earliest",
+	})
+	require.NoError(t, err, "failed to create kafka consumer")
+
+	consumerCtx, cancel := context.WithCancel(ctx)
+	consumerErrCh := make(chan error, 1)
+	go func() {
+		consumerErrCh <- message_adapter.NewConsumer(consumer, svc, logger, topic).Run(consumerCtx)
+	}()
+
+	defer func() {
+		cancel()
+		select {
+		case err := <-consumerErrCh:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("kafka consumer returned error: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Error("kafka consumer did not stop within timeout")
+		}
+	}()
+
+	// Qdrant コレクションを準備
+	indexName := fmt.Sprintf("kafka-index-test-%d", time.Now().UnixNano())
+	vector := []float32{0.12, 0.34, 0.56}
+
+	qCollectionsClient := qdrant.NewCollectionsClient(qdrantConn)
+	_, err = qCollectionsClient.Create(ctx, &qdrant.CreateCollection{
+		CollectionName: indexName,
+		VectorsConfig: &qdrant.VectorsConfig{Config: &qdrant.VectorsConfig_Params{
+			Params: &qdrant.VectorParams{Size: uint64(len(vector)), Distance: qdrant.Distance_Cosine},
+		}},
+	})
+	if err != nil && !strings.Contains(err.Error(), "already exists") {
+		require.NoError(t, err, "failed to create qdrant collection")
+	}
+
+	// Kafka プロデューサーでメッセージを送信
+	producer, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers": kafkaBootstrap,
+	})
+	require.NoError(t, err, "failed to create kafka producer")
+	defer producer.Close()
+
+	docID := "44444444-4444-4444-4444-444444444444"
+	payload := map[string]interface{}{
+		"payload": map[string]interface{}{
+			"index_name":  indexName,
+			"document_id": docID,
+			"action":      "UPSERT",
+			"fields": map[string]interface{}{
+				"content": "Kafka integration test document",
+			},
+			"vector": vector,
+		},
+	}
+
+	value, err := json.Marshal(payload)
+	require.NoError(t, err, "failed to marshal kafka payload")
+
+	deliveryChan := make(chan kafka.Event, 1)
+	err = producer.Produce(&kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+		Value:          value,
+	}, deliveryChan)
+	require.NoError(t, err, "failed to produce kafka message")
+
+	select {
+	case ev := <-deliveryChan:
+		m, ok := ev.(*kafka.Message)
+		require.True(t, ok, "expected kafka message event")
+		require.NoError(t, m.TopicPartition.Error, "kafka delivery error")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for kafka delivery report")
+	}
+	close(deliveryChan)
+	producer.Flush(5000)
+
+	// Elasticsearch への反映を待つ
+	require.Eventually(t, func() bool {
+		docs, err := repo.KeywordSearch(context.Background(), indexName, "Kafka")
+		if err != nil {
+			return false
+		}
+		for _, d := range docs {
+			if d.ID == docID {
+				return true
+			}
+		}
+		return false
+	}, 30*time.Second, 1*time.Second, "document should be indexed in Elasticsearch via Kafka consumer")
+
+	// Qdrant への反映を待つ
+	require.Eventually(t, func() bool {
+		docs, err := repo.VectorSearch(context.Background(), indexName, vector)
+		if err != nil {
+			return false
+		}
+		for _, d := range docs {
+			if d.ID == docID {
+				return true
+			}
+		}
+		return false
+	}, 30*time.Second, 1*time.Second, "document should be indexed in Qdrant via Kafka consumer")
+}
 ```
 ---

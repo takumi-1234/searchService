@@ -1,15 +1,18 @@
 name: CI
 
 on:
+  pull_request:
   push:
     branches:
       - main
-  pull_request:
 
 jobs:
-  build:
+  validate:
+    name: Validate & Test
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    env:
+      GO_VERSION: "1.24.7"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -17,30 +20,38 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.24.7"
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: |
+            go.sum
 
-      - name: Cache Go dependencies
-        uses: actions/cache@v4
+      - name: Install Buf CLI
+        uses: bufbuild/buf-setup-action@v1
         with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
+          github_token: ${{ github.token }}
 
-      - name: Install tools
+      - name: Ensure Go bin on PATH
+        run: echo "${HOME}/go/bin" >> $GITHUB_PATH
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Install Go tools
         run: |
-          go mod download
+          go install golang.org/x/tools/cmd/goimports@v0.24.0
           go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.60.3
 
-      - name: Run lint
-        run: make lint
+      - name: Run aggregated CI checks
+        run: make ci
 
-      - name: Run unit tests
-        run: make test-unit
+      - name: Run end-to-end tests
+        run: make test-e2e
 
       - name: Run integration tests
         env:
           TESTCONTAINERS_RYUK_DISABLED: "true"
         run: make test-integration
+
+      - name: Build Docker image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: docker build -t search-service:${{ github.sha }} .

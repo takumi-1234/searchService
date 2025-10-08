@@ -65,9 +65,26 @@ type IndexDocumentParams struct {
 
 // SearchRepositoryはデータストアへのアクセスを抽象化します。
 type SearchRepository interface {
-	KeywordSearch(ctx context.Context, indexName, query string) ([]Document, error)
-	VectorSearch(ctx context.Context, indexName string, vector []float32) ([]Document, error)
+	KeywordSearch(ctx context.Context, params KeywordSearchParams) ([]Document, error)
+	VectorSearch(ctx context.Context, params VectorSearchParams) ([]Document, error)
 	IndexDocument(ctx context.Context, params IndexDocumentParams) error
 	DeleteDocument(ctx context.Context, indexName, documentID string) error
 	CreateIndex(ctx context.Context, params CreateIndexParams) error
+}
+
+// KeywordSearchParamsはキーワード検索に必要な情報を表します。
+type KeywordSearchParams struct {
+	IndexName string
+	Query     string
+	Filters   []SearchFilter
+	Sort      *SearchSort
+	PageSize  int
+}
+
+// VectorSearchParamsはベクトル検索に必要な情報を表します。
+type VectorSearchParams struct {
+	IndexName string
+	Vector    []float32
+	Filters   []SearchFilter
+	PageSize  int
 }

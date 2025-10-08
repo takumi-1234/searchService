@@ -1,0 +1,88 @@
+name: Security Scans
+
+on:
+  pull_request:
+    paths:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+      - Dockerfile
+      - ".github/workflows/security.yaml"
+  workflow_dispatch:
+  schedule:
+    - cron: "30 3 * * *"
+
+jobs:
+  sast:
+    name: GoSec SAST
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GO_VERSION: "1.24.7"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.21.3
+
+      - name: Run gosec
+        run: $HOME/go/bin/gosec ./...
+
+  sca:
+    name: Trivy Dependency Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Trivy
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          format: table
+          vuln-type: "library,config"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+  dast:
+    name: ZAP Baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start stack
+        run: |
+          docker compose up -d search-service
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:9464/metrics >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "metrics endpoint did not become ready" >&2
+          docker compose logs search-service
+          exit 1
+
+      - name: ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.10.0
+        with:
+          target: "http://127.0.0.1:9464/metrics"
+          cmd_options: "-m 2 -I"
+          allow_issue_writing: false
+
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v

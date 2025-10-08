@@ -5,16 +5,20 @@ services:
       dockerfile: Dockerfile
     ports:
       - "50051:50051"
+      - "9464:9464"
     environment:
       - SEARCH_ELASTICSEARCH_ADDRESSES=http://elasticsearch:9200
       - SEARCH_QDRANT_ADDRESS=qdrant:6334
       - SEARCH_KAFKA_BROKERS=kafka:9092
       - SEARCH_KAFKA_GROUPID=search-service-consumer
       - SEARCH_KAFKA_TOPIC=search.indexing.requests
+      - SEARCH_OBSERVABILITY_METRICS_ADDRESS=:9464
+      - SEARCH_OBSERVABILITY_TRACING_ENDPOINT=jaeger:4318
     depends_on:
       - elasticsearch
       - qdrant
       - kafka
+      - jaeger
     networks:
       - search_net
 
@@ -67,6 +71,27 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    networks:
+      - search_net
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.58
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+    networks:
+      - search_net
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    depends_on:
+      - search-service
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    volumes:
+      - ./deployments/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
     networks:
       - search_net
 

@@ -6,13 +6,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"reflect"
+	"strconv"
 	"strings"
 
 	"github.com/elastic/go-elasticsearch/v9"
 	"github.com/elastic/go-elasticsearch/v9/typedapi/core/search"
 	"github.com/elastic/go-elasticsearch/v9/typedapi/types"
 	"github.com/elastic/go-elasticsearch/v9/typedapi/types/enums/result"
+	"github.com/elastic/go-elasticsearch/v9/typedapi/types/enums/sortorder"
 	"github.com/qdrant/go-client/qdrant"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
@@ -39,16 +42,32 @@ func NewSearchRepository(es *elasticsearch.TypedClient, qdrantConn *grpc.ClientC
 }
 
 // KeywordSearch は Elasticsearch を使用してキーワード検索を実行します。
-func (r *searchRepository) KeywordSearch(ctx context.Context, indexName, query string) ([]port.Document, error) {
+func (r *searchRepository) KeywordSearch(ctx context.Context, params port.KeywordSearchParams) ([]port.Document, error) {
+	boolQuery, err := buildElasticsearchBoolQuery(params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build elasticsearch query: %w", err)
+	}
+
 	req := &search.Request{
 		Query: &types.Query{
-			Match: map[string]types.MatchQuery{
-				"content": {Query: query},
-			},
+			Bool: boolQuery,
 		},
 	}
 
-	res, err := r.esClient.Search().Index(indexName).Request(req).Do(ctx)
+	if params.PageSize > 0 {
+		size := params.PageSize
+		req.Size = &size
+	}
+
+	if params.Sort != nil {
+		sortOptions, err := buildElasticsearchSort(params.Sort)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build sort options: %w", err)
+		}
+		req.Sort = sortOptions
+	}
+
+	res, err := r.esClient.Search().Index(params.IndexName).Request(req).Do(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("elasticsearch search request failed: %w", err)
 	}
@@ -77,14 +96,27 @@ func (r *searchRepository) KeywordSearch(ctx context.Context, indexName, query s
 }
 
 // VectorSearch は Qdrant を使用してベクトル検索を実行します。
-func (r *searchRepository) VectorSearch(ctx context.Context, indexName string, vector []float32) ([]port.Document, error) {
+func (r *searchRepository) VectorSearch(ctx context.Context, params port.VectorSearchParams) ([]port.Document, error) {
+	limit := uint64(10)
+	if params.PageSize > 0 {
+		limit = uint64(params.PageSize)
+	}
+
 	req := &qdrant.SearchPoints{
-		CollectionName: indexName,
-		Vector:         vector,
-		Limit:          10,
+		CollectionName: params.IndexName,
+		Vector:         params.Vector,
+		Limit:          limit,
 		WithPayload: &qdrant.WithPayloadSelector{
 			SelectorOptions: &qdrant.WithPayloadSelector_Enable{Enable: true},
 		},
+	}
+
+	if len(params.Filters) > 0 {
+		filter, err := buildQdrantFilter(params.Filters)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build qdrant filter: %w", err)
+		}
+		req.Filter = filter
 	}
 
 	res, err := r.qdrantPoints.Search(ctx, req)
@@ -126,7 +158,6 @@ func (r *searchRepository) IndexDocument(ctx context.Context, params port.IndexD
 		if err != nil {
 			return fmt.Errorf("failed to index document in elasticsearch: %w", err)
 		}
-		// 修正点: 文字列比較をenum定数比較に変更
 		if res.Result != result.Created && res.Result != result.Updated {
 			return fmt.Errorf("unexpected elasticsearch index result: %s", res.Result)
 		}
@@ -174,7 +205,6 @@ func (r *searchRepository) DeleteDocument(ctx context.Context, indexName, docume
 		if err != nil {
 			return fmt.Errorf("failed to delete document from elasticsearch: %w", err)
 		}
-		// 修正点: 文字列比較をenum定数比較に変更
 		if res.Result.Name != "deleted" && res.Result.Name != "not_found" {
 			return fmt.Errorf("unexpected elasticsearch delete result: %s", res.Result)
 		}
@@ -184,7 +214,6 @@ func (r *searchRepository) DeleteDocument(ctx context.Context, indexName, docume
 	// Qdrantからの削除
 	g.Go(func() error {
 		wait := true
-		// 修正点: メソッド名を Delete に変更
 		_, err := r.qdrantPoints.Delete(gCtx, &qdrant.DeletePoints{
 			CollectionName: indexName,
 			Wait:           &wait,
@@ -294,6 +323,110 @@ func (r *searchRepository) createQdrantCollection(ctx context.Context, params po
 	return nil
 }
 
+func buildElasticsearchBoolQuery(params port.KeywordSearchParams) (*types.BoolQuery, error) {
+	boolQuery := &types.BoolQuery{}
+
+	if strings.TrimSpace(params.Query) == "" {
+		boolQuery.Must = append(boolQuery.Must, types.Query{
+			MatchAll: &types.MatchAllQuery{},
+		})
+	} else {
+		boolQuery.Must = append(boolQuery.Must, types.Query{
+			Match: map[string]types.MatchQuery{
+				"content": {Query: params.Query},
+			},
+		})
+	}
+
+	for _, filter := range params.Filters {
+		if filter.Value == nil && filter.Operator != "neq" {
+			return nil, fmt.Errorf("filter value for field %q must not be nil", filter.Field)
+		}
+		switch filter.Operator {
+		case "eq":
+			boolQuery.Filter = append(boolQuery.Filter, buildElasticsearchTermQuery(filter.Field, filter.Value))
+		case "neq":
+			boolQuery.MustNot = append(boolQuery.MustNot, buildElasticsearchTermQuery(filter.Field, filter.Value))
+		case "gt", "lt":
+			rangeQuery, err := buildElasticsearchRangeQuery(filter)
+			if err != nil {
+				return nil, err
+			}
+			boolQuery.Filter = append(boolQuery.Filter, rangeQuery)
+		default:
+			return nil, fmt.Errorf("unsupported filter operator %q for elasticsearch", filter.Operator)
+		}
+	}
+
+	return boolQuery, nil
+}
+
+func buildElasticsearchTermQuery(field string, value interface{}) types.Query {
+	return types.Query{
+		Term: map[string]types.TermQuery{
+			field: {
+				Value: value,
+			},
+		},
+	}
+}
+
+func buildElasticsearchRangeQuery(filter port.SearchFilter) (types.Query, error) {
+	value, err := coerceToFloat64(filter.Value)
+	if err != nil {
+		return types.Query{}, fmt.Errorf("range filter requires numeric value for field %q: %w", filter.Field, err)
+	}
+
+	rangeQuery := types.NewNumberRangeQuery()
+	switch filter.Operator {
+	case "gt":
+		v := types.Float64(value)
+		rangeQuery.Gt = &v
+	case "lt":
+		v := types.Float64(value)
+		rangeQuery.Lt = &v
+	default:
+		return types.Query{}, fmt.Errorf("range query not supported for operator %q", filter.Operator)
+	}
+
+	return types.Query{
+		Range: map[string]types.RangeQuery{
+			filter.Field: *rangeQuery.RangeQueryCaster(),
+		},
+	}, nil
+}
+
+func buildElasticsearchSort(sort *port.SearchSort) ([]types.SortCombinations, error) {
+	sortOption := types.NewSortOptions()
+	order, err := parseSortOrder(sort.Order)
+	if err != nil {
+		return nil, err
+	}
+
+	if strings.EqualFold(sort.Field, "_score") {
+		sortOption.Score_ = &types.ScoreSort{Order: &order}
+	} else {
+		fieldSort := types.FieldSort{
+			Order: &order,
+		}
+		sortOption.SortOptions[sort.Field] = fieldSort
+	}
+
+	return []types.SortCombinations{*sortOption.SortCombinationsCaster()}, nil
+}
+
+func parseSortOrder(order string) (sortorder.SortOrder, error) {
+	switch strings.ToLower(order) {
+	case "", "asc":
+		return sortorder.Asc, nil
+	case "desc":
+		return sortorder.Desc, nil
+	default:
+		var zero sortorder.SortOrder
+		return zero, fmt.Errorf("unsupported sort order %q", order)
+	}
+}
+
 func toElasticsearchFieldType(fieldType string) (string, error) {
 	switch normalized := strings.ToLower(fieldType); normalized {
 	case port.FieldTypeText:
@@ -326,6 +459,153 @@ func toQdrantDistance(distance port.VectorDistance) (qdrant.Distance, error) {
 	}
 }
 
+func buildQdrantFilter(filters []port.SearchFilter) (*qdrant.Filter, error) {
+	if len(filters) == 0 {
+		return nil, nil
+	}
+
+	filter := &qdrant.Filter{}
+	for _, f := range filters {
+		switch f.Operator {
+		case "eq":
+			condition, err := qdrantEqualityCondition(f.Field, f.Value)
+			if err != nil {
+				return nil, err
+			}
+			filter.Must = append(filter.Must, condition)
+		case "neq":
+			condition, err := qdrantEqualityCondition(f.Field, f.Value)
+			if err != nil {
+				return nil, err
+			}
+			filter.MustNot = append(filter.MustNot, condition)
+		case "gt":
+			condition, err := qdrantRangeCondition(f.Field, f.Value, true)
+			if err != nil {
+				return nil, err
+			}
+			filter.Must = append(filter.Must, condition)
+		case "lt":
+			condition, err := qdrantRangeCondition(f.Field, f.Value, false)
+			if err != nil {
+				return nil, err
+			}
+			filter.Must = append(filter.Must, condition)
+		default:
+			return nil, fmt.Errorf("unsupported filter operator %q for qdrant", f.Operator)
+		}
+	}
+
+	return filter, nil
+}
+
+func qdrantEqualityCondition(field string, value interface{}) (*qdrant.Condition, error) {
+	match, err := convertToQdrantMatch(value)
+	if err != nil {
+		if numErr, ok := err.(errNonIntegerNumeric); ok {
+			return qdrantEqualityRangeCondition(field, float64(numErr)), nil
+		}
+		return nil, fmt.Errorf("failed to build qdrant equality condition: %w", err)
+	}
+
+	return &qdrant.Condition{
+		ConditionOneOf: &qdrant.Condition_Field{
+			Field: &qdrant.FieldCondition{
+				Key:   field,
+				Match: match,
+			},
+		},
+	}, nil
+}
+
+func qdrantRangeCondition(field string, value interface{}, isGreater bool) (*qdrant.Condition, error) {
+	num, err := coerceToFloat64(value)
+	if err != nil {
+		return nil, fmt.Errorf("range filters require numeric value for field %q: %w", field, err)
+	}
+
+	rangeCondition := &qdrant.Range{}
+	if isGreater {
+		rangeCondition.Gt = &num
+	} else {
+		rangeCondition.Lt = &num
+	}
+
+	return &qdrant.Condition{
+		ConditionOneOf: &qdrant.Condition_Field{
+			Field: &qdrant.FieldCondition{
+				Key:   field,
+				Range: rangeCondition,
+			},
+		},
+	}, nil
+}
+
+func qdrantEqualityRangeCondition(field string, value float64) *qdrant.Condition {
+	rangeCondition := &qdrant.Range{
+		Gte: &value,
+		Lte: &value,
+	}
+	return &qdrant.Condition{
+		ConditionOneOf: &qdrant.Condition_Field{
+			Field: &qdrant.FieldCondition{
+				Key:   field,
+				Range: rangeCondition,
+			},
+		},
+	}
+}
+
+type errNonIntegerNumeric float64
+
+func (e errNonIntegerNumeric) Error() string {
+	return "non-integer numeric value"
+}
+
+func convertToQdrantMatch(value interface{}) (*qdrant.Match, error) {
+	switch v := value.(type) {
+	case string:
+		return &qdrant.Match{MatchValue: &qdrant.Match_Keyword{Keyword: v}}, nil
+	case bool:
+		return &qdrant.Match{MatchValue: &qdrant.Match_Boolean{Boolean: v}}, nil
+	case int:
+		return &qdrant.Match{MatchValue: &qdrant.Match_Integer{Integer: int64(v)}}, nil
+	case int64:
+		return &qdrant.Match{MatchValue: &qdrant.Match_Integer{Integer: v}}, nil
+	case float64:
+		if math.Mod(v, 1.0) == 0 {
+			return &qdrant.Match{MatchValue: &qdrant.Match_Integer{Integer: int64(v)}}, nil
+		}
+		return nil, errNonIntegerNumeric(v)
+	case float32:
+		if math.Mod(float64(v), 1.0) == 0 {
+			return &qdrant.Match{MatchValue: &qdrant.Match_Integer{Integer: int64(v)}}, nil
+		}
+		return nil, errNonIntegerNumeric(v)
+	default:
+		return nil, fmt.Errorf("unsupported value type %T for qdrant equality match", value)
+	}
+}
+
+func coerceToFloat64(value interface{}) (float64, error) {
+	switch v := value.(type) {
+	case float64:
+		return v, nil
+	case float32:
+		return float64(v), nil
+	case int:
+		return float64(v), nil
+	case int64:
+		return float64(v), nil
+	case json.Number:
+		return v.Float64()
+	case string:
+		return strconv.ParseFloat(v, 64)
+	default:
+		return 0, fmt.Errorf("cannot convert value of type %T to float64", value)
+	}
+}
+
 // ... (valueFromQdrant, payloadToQdrant ヘルパー関数は変更なし)
 func valueFromQdrant(v *qdrant.Value) interface{} {
 	switch kind := v.GetKind().(type) {
@@ -355,6 +635,7 @@ func valueFromQdrant(v *qdrant.Value) interface{} {
 		return nil
 	}
 }
+
 func payloadToQdrant(fields map[string]interface{}) (map[string]*qdrant.Value, error) {
 	payload := make(map[string]*qdrant.Value, len(fields))
 	for k, v := range fields {
@@ -366,6 +647,7 @@ func payloadToQdrant(fields map[string]interface{}) (map[string]*qdrant.Value, e
 	}
 	return payload, nil
 }
+
 func toQdrantValue(v interface{}) (*qdrant.Value, error) {
 	switch val := v.(type) {
 	case string:

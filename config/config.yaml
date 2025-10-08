@@ -19,3 +19,16 @@ kafka:
     - "localhost:9092"
   groupId: "search-service-consumer"
   topic: "search.indexing.requests"
+
+search:
+  hybrid:
+    weights:
+      keyword: 0.5
+      vector: 0.5
+
+observability:
+  metrics:
+    address: ":9464"
+  tracing:
+    endpoint: "jaeger:4318"
+    insecure: true

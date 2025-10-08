@@ -37,18 +37,10 @@ func (s *Server) SearchDocuments(ctx context.Context, req *searchv1.SearchDocume
 		return nil, status.Error(codes.InvalidArgument, "index_name is a required field")
 	}
 
-	params := port.SearchParams{
-		IndexName: req.GetIndexName(),
-		QueryText: req.GetQueryText(),
-		QueryVector: func() []float32 {
-			if len(req.GetQueryVector()) == 0 {
-				return nil
-			}
-			// Create a copy to avoid retaining protobuf backing array
-			vec := make([]float32, len(req.GetQueryVector()))
-			copy(vec, req.GetQueryVector())
-			return vec
-		}(),
+	params, err := buildSearchParams(req)
+	if err != nil {
+		s.logger.Warn("invalid search request", zap.Error(err))
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
 	searchResult, err := s.svc.Search(ctx, params)
@@ -73,9 +65,69 @@ func (s *Server) SearchDocuments(ctx context.Context, req *searchv1.SearchDocume
 	}
 
 	return &searchv1.SearchDocumentsResponse{
-		Results:    results,
-		TotalCount: searchResult.TotalCount,
+		Results:       results,
+		TotalCount:    searchResult.TotalCount,
+		NextPageToken: searchResult.NextPageToken,
 	}, nil
+}
+
+func buildSearchParams(req *searchv1.SearchDocumentsRequest) (port.SearchParams, error) {
+	params := port.SearchParams{
+		IndexName: req.GetIndexName(),
+		QueryText: req.GetQueryText(),
+		QueryVector: func() []float32 {
+			if len(req.GetQueryVector()) == 0 {
+				return nil
+			}
+			vec := make([]float32, len(req.GetQueryVector()))
+			copy(vec, req.GetQueryVector())
+			return vec
+		}(),
+		PageSize:  int(req.GetPageSize()),
+		PageToken: req.GetPageToken(),
+	}
+
+	if params.PageSize < 0 {
+		return port.SearchParams{}, fmt.Errorf("page_size must be positive")
+	}
+
+	if len(req.GetFilters()) > 0 {
+		params.Filters = make([]port.SearchFilter, 0, len(req.GetFilters()))
+		for _, f := range req.GetFilters() {
+			if f.GetField() == "" {
+				return port.SearchParams{}, fmt.Errorf("filter field is required")
+			}
+			op, err := convertProtoFilterOperator(f.GetOperator())
+			if err != nil {
+				return port.SearchParams{}, err
+			}
+			val := interface{}(nil)
+			if f.GetValue() != nil {
+				val = f.GetValue().AsInterface()
+			}
+			params.Filters = append(params.Filters, port.SearchFilter{
+				Field:    f.GetField(),
+				Operator: op,
+				Value:    val,
+			})
+		}
+	}
+
+	if req.GetSortBy() != nil {
+		if req.GetSortBy().GetField() == "" {
+			return port.SearchParams{}, fmt.Errorf("sort field is required")
+		}
+		sortOrder, err := convertProtoSortOrder(req.GetSortBy().GetOrder())
+		if err != nil {
+			return port.SearchParams{}, err
+		}
+		params.Sort = &port.SearchSort{
+			Field: req.GetSortBy().GetField(),
+			Order: sortOrder,
+		}
+	}
+
+	return params, nil
 }
 
 // CreateIndex は CreateIndex RPC を処理します。
@@ -175,6 +227,34 @@ func convertProtoVectorDistance(distance searchv1.VectorConfig_Distance) (port.V
 		return port.VectorDistanceDot, nil
 	default:
 		return "", fmt.Errorf("unsupported vector distance: %s", distance.String())
+	}
+}
+
+func convertProtoFilterOperator(op searchv1.Filter_Operator) (string, error) {
+	switch op {
+	case searchv1.Filter_OPERATOR_EQUAL:
+		return "eq", nil
+	case searchv1.Filter_OPERATOR_NOT_EQUAL:
+		return "neq", nil
+	case searchv1.Filter_OPERATOR_GREATER_THAN:
+		return "gt", nil
+	case searchv1.Filter_OPERATOR_LESS_THAN:
+		return "lt", nil
+	case searchv1.Filter_OPERATOR_UNSPECIFIED:
+		return "", fmt.Errorf("filter operator is required")
+	default:
+		return "", fmt.Errorf("unsupported filter operator: %s", op.String())
+	}
+}
+
+func convertProtoSortOrder(order searchv1.SortBy_Order) (string, error) {
+	switch order {
+	case searchv1.SortBy_ORDER_UNSPECIFIED, searchv1.SortBy_ORDER_ASC:
+		return "asc", nil
+	case searchv1.SortBy_ORDER_DESC:
+		return "desc", nil
+	default:
+		return "", fmt.Errorf("unsupported sort order: %s", order.String())
 	}
 }
 
