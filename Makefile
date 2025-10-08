@@ -50,21 +50,77 @@ test-integration:
 # test-load: k6 を使った負荷テストを実行します
 test-load:
 	@echo ">> Running k6 load test..."
-	@if command -v k6 >/dev/null 2>&1; then \
-		K6_VUS=$(K6_VUS) K6_DURATION=$(K6_DURATION) GRPC_TARGET=$(GRPC_TARGET) k6 run tests/perf/k6/search.js; \
-	elif command -v docker >/dev/null 2>&1; then \
-		echo "k6 CLI not found. Falling back to grafana/k6 container image..."; \
-		docker run --rm \
-			-e K6_VUS=$(K6_VUS) \
-			-e K6_DURATION=$(K6_DURATION) \
-			-e GRPC_TARGET=$(GRPC_TARGET) \
-			-v "$(PWD)":/src \
-			-w /src \
-			grafana/k6:0.49.0 run tests/perf/k6/search.js; \
-	else \
-		echo "k6 CLI is missing and Docker is unavailable. Install k6 (https://grafana.com/docs/k6/latest/setup/)" >&2; \
-		exit 1; \
-	fi
+	@bash -c '\
+		set -euo pipefail; \
+		GRPC_TARGET_VALUE="$${GRPC_TARGET:-127.0.0.1:50071}"; \
+		if ! echo "$$GRPC_TARGET_VALUE" | grep -q ":"; then \
+			GRPC_TARGET_VALUE="$$GRPC_TARGET_VALUE:50071"; \
+		fi; \
+		GRPC_PORT="$${GRPC_TARGET_VALUE##*:}"; \
+		case "$$GRPC_PORT" in \
+			*[!0-9]*) \
+				echo "Invalid GRPC_TARGET port in $$GRPC_TARGET_VALUE" >&2; \
+				exit 1; \
+				;; \
+		esac; \
+		if command -v k6 >/dev/null 2>&1; then \
+			PERF_GRPC_PORT=$$GRPC_PORT go run ./tests/perf/harness >/tmp/search-service-perf.log 2>&1 & \
+			HARNESS_PID=$$!; \
+			trap "kill $$HARNESS_PID >/dev/null 2>&1 || true" EXIT INT TERM; \
+			sleep 2; \
+			K6_VUS=$(K6_VUS) K6_DURATION=$(K6_DURATION) GRPC_TARGET=$$GRPC_TARGET_VALUE k6 run tests/perf/k6/search.js; \
+			elif command -v docker >/dev/null 2>&1; then \
+				echo "k6 CLI not found. Falling back to grafana/k6 container image..."; \
+				RUN_ID=$$(date +%s); \
+				DOCKER_NET="search-service-perf-net-$$RUN_ID"; \
+				HARNESS_CONTAINER="search-service-perf-harness-$$RUN_ID"; \
+				mkdir -p .cache/gomod .cache/gocache; \
+				cleanup() { \
+					docker rm -f "$$HARNESS_CONTAINER" >/dev/null 2>&1 || true; \
+					docker network rm "$$DOCKER_NET" >/dev/null 2>&1 || true; \
+				}; \
+				trap cleanup EXIT INT TERM; \
+				docker network create "$$DOCKER_NET" >/dev/null; \
+				HARNESS_ID=$$(docker run -d \
+					--name "$$HARNESS_CONTAINER" \
+					--network "$$DOCKER_NET" \
+					-v "$(PWD)":/src \
+					-v "$(PWD)/.cache/gomod":/go/pkg/mod \
+					-v "$(PWD)/.cache/gocache":/root/.cache/go-build \
+					-w /src \
+					-e GOMODCACHE=/go/pkg/mod \
+					-e PERF_GRPC_PORT=$$GRPC_PORT \
+					golang:1 go run ./tests/perf/harness); \
+				WAIT_SECONDS=0; \
+				while [ $$WAIT_SECONDS -lt 90 ]; do \
+					if [ "$$(docker inspect -f '{{.State.Running}}' "$$HARNESS_CONTAINER" 2>/dev/null)" != "true" ]; then \
+						docker logs "$$HARNESS_CONTAINER" || true; \
+						exit 1; \
+					fi; \
+					if docker logs "$$HARNESS_CONTAINER" 2>&1 | grep -q "perf harness gRPC server listening"; then \
+						break; \
+					fi; \
+					sleep 1; \
+					WAIT_SECONDS=$$((WAIT_SECONDS + 1)); \
+				done; \
+				if [ $$WAIT_SECONDS -ge 90 ]; then \
+					echo "timed out waiting for harness to start" >&2; \
+					docker logs "$$HARNESS_CONTAINER" || true; \
+					exit 1; \
+				fi; \
+				docker run --rm \
+					--network "$$DOCKER_NET" \
+					-e K6_VUS=$(K6_VUS) \
+					-e K6_DURATION=$(K6_DURATION) \
+				-e GRPC_TARGET=$$HARNESS_CONTAINER:$$GRPC_PORT \
+				-v "$(PWD)":/src \
+				-w /src \
+				grafana/k6:0.49.0 run tests/perf/k6/search.js; \
+		else \
+			echo "k6 CLI is missing and Docker is unavailable. Install k6 (https://grafana.com/docs/k6/latest/setup/)" >&2; \
+			exit 1; \
+		fi \
+	'
 
 # lint: golangci-lint を使って静的解析を実行します
 lint:
