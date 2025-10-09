@@ -45,7 +45,7 @@ test-e2e:
 # test-integration: 統合テストを実行します
 test-integration:
 	@echo ">> Running integration tests..."
-	go test -tags=integration ./tests/integration/...
+	go test -tags=integration -timeout 20m ./tests/integration/...
 
 # test-load: k6 を使った負荷テストを実行します
 test-load:

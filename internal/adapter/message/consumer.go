@@ -105,13 +105,11 @@ type consumerMetrics struct {
 	lagRegistration metric.Registration
 }
 
-func (m *consumerMetrics) unregister() {
-	if m == nil {
-		return
+func (m *consumerMetrics) unregister() error {
+	if m == nil || m.lagRegistration == nil {
+		return nil
 	}
-	if m.lagRegistration != nil {
-		m.lagRegistration.Unregister()
-	}
+	return m.lagRegistration.Unregister()
 }
 
 // NewConsumer は新しいConsumerインスタンスを生成します。
@@ -516,7 +514,9 @@ func (c *Consumer) close() error {
 	}
 
 	if c.metrics != nil {
-		c.metrics.unregister()
+		if err := c.metrics.unregister(); err != nil {
+			closeErr = errors.Join(closeErr, err)
+		}
 	}
 
 	return closeErr

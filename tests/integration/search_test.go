@@ -121,113 +121,80 @@ func getFreePort() (int, error) {
 	return addr.Port, nil
 }
 
-// setupKafka は Kafka (および必要な Zookeeper) の testcontainer をセットアップします。
+// setupKafka は KRaft モードの Kafka testcontainer をセットアップします。
 func setupKafka(ctx context.Context) (string, func(), error) {
 	const (
-		containerKafkaPortExternal = "29092/tcp"
-		containerKafkaPortInternal = "9092/tcp"
-		containerZkPort            = "2181/tcp"
+		containerKafkaPort       = "9092/tcp"
+		containerControllerPort  = "9093/tcp"
+		clusterIDBase64          = "ZHVtbXkta3JhZnQtY2x1c3Rlci0x"
+		controllerListenerName   = "CONTROLLER"
+		controllerListenerConfig = "CONTROLLER://0.0.0.0:9093"
+		kafkaReadyLog            = "Kafka Server started"
 	)
-
-	networkName := fmt.Sprintf("kafka-net-%d", time.Now().UnixNano())
-	network, err := testcontainers.GenericNetwork(ctx, testcontainers.GenericNetworkRequest{
-		NetworkRequest: testcontainers.NetworkRequest{
-			Name:   networkName,
-			Driver: "bridge",
-		},
-	})
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to create network: %w", err)
-	}
 
 	kafkaHostPort, err := getFreePort()
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to get free port for kafka: %w", err)
 	}
 
-	// Zookeeper コンテナの起動
-	zkReq := testcontainers.ContainerRequest{
-		Image: "confluentinc/cp-zookeeper:7.6.1",
-		Env: map[string]string{
-			"ZOOKEEPER_CLIENT_PORT": "2181",
-			"ZOOKEEPER_TICK_TIME":   "2000",
-		},
-		Networks:       []string{networkName},
-		NetworkAliases: map[string][]string{networkName: {"zookeeper"}},
-		ExposedPorts:   []string{containerZkPort},
-		WaitingFor:     wait.ForListeningPort(containerZkPort).WithStartupTimeout(240 * time.Second),
-	}
-	zkContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{ContainerRequest: zkReq, Started: true})
-	if err != nil {
-		network.Remove(ctx) //nolint:errcheck // best effort cleanup
-		return "", nil, fmt.Errorf("failed to start zookeeper container: %w", err)
-	}
-
-	// Kafka コンテナの起動
 	kafkaReq := testcontainers.ContainerRequest{
 		Image: "confluentinc/cp-kafka:7.6.1",
 		Env: map[string]string{
-			"KAFKA_BROKER_ID":                                "1",
-			"KAFKA_ZOOKEEPER_CONNECT":                        "zookeeper:2181",
-			"KAFKA_ENABLE_KRAFT":                             "false",
-			"KAFKA_LISTENER_SECURITY_PROTOCOL_MAP":           "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT",
-			"KAFKA_LISTENERS":                                "PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092",
-			"KAFKA_ADVERTISED_LISTENERS":                     fmt.Sprintf("PLAINTEXT://kafka:9092,PLAINTEXT_HOST://127.0.0.1:%d", kafkaHostPort),
+			"KAFKA_ENABLE_KRAFT":                             "true",
+			"KAFKA_PROCESS_ROLES":                            "broker,controller",
+			"KAFKA_CLUSTER_ID":                               clusterIDBase64,
+			"KAFKA_NODE_ID":                                  "1",
+			"KAFKA_LISTENER_SECURITY_PROTOCOL_MAP":           "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT",
+			"KAFKA_LISTENERS":                                fmt.Sprintf("PLAINTEXT://0.0.0.0:9092,%s", controllerListenerConfig),
+			"KAFKA_ADVERTISED_LISTENERS":                     fmt.Sprintf("PLAINTEXT://127.0.0.1:%d", kafkaHostPort),
+			"KAFKA_CONTROLLER_QUORUM_VOTERS":                 "1@localhost:9093",
+			"KAFKA_CONTROLLER_LISTENER_NAMES":                controllerListenerName,
 			"KAFKA_INTER_BROKER_LISTENER_NAME":               "PLAINTEXT",
 			"KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR":         "1",
 			"KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR": "1",
 			"KAFKA_TRANSACTION_STATE_LOG_MIN_ISR":            "1",
+			"KAFKA_LOG_DIRS":                                 "/tmp/kraft-combined-logs",
 			"KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS":         "0",
 			"KAFKA_AUTO_CREATE_TOPICS_ENABLE":                "true",
 			"KAFKA_HEAP_OPTS":                                "-Xms256m -Xmx256m",
 			"KAFKA_ALLOW_PLAINTEXT_LISTENER":                 "yes",
 		},
-		ExposedPorts:   []string{containerKafkaPortExternal, containerKafkaPortInternal},
-		Networks:       []string{networkName},
-		NetworkAliases: map[string][]string{networkName: {"kafka"}},
+		ExposedPorts: []string{containerKafkaPort, containerControllerPort},
 		WaitingFor: wait.ForAll(
-			wait.ForListeningPort(containerKafkaPortInternal).WithStartupTimeout(300*time.Second),
-			wait.ForLog("started (kafka.server.KafkaServer)").WithStartupTimeout(300*time.Second),
+			wait.ForListeningPort(containerKafkaPort).WithStartupTimeout(300*time.Second),
+			wait.ForLog(kafkaReadyLog).WithStartupTimeout(300*time.Second),
 		),
 		HostConfigModifier: func(hc *container.HostConfig) {
 			if hc.PortBindings == nil {
 				hc.PortBindings = nat.PortMap{}
 			}
-			internalPort := nat.Port(containerKafkaPortInternal)
-			if _, ok := hc.PortBindings[internalPort]; !ok {
-				hc.PortBindings[internalPort] = []nat.PortBinding{
+			clientPort := nat.Port(containerKafkaPort)
+			hc.PortBindings[clientPort] = []nat.PortBinding{
+				{
+					HostIP:   "127.0.0.1",
+					HostPort: strconv.Itoa(kafkaHostPort),
+				},
+			}
+			controllerPort := nat.Port(containerControllerPort)
+			if _, ok := hc.PortBindings[controllerPort]; !ok {
+				hc.PortBindings[controllerPort] = []nat.PortBinding{
 					{
 						HostIP:   "0.0.0.0",
 						HostPort: "0",
 					},
 				}
 			}
-			externalPort := nat.Port(containerKafkaPortExternal)
-			hc.PortBindings[externalPort] = []nat.PortBinding{
-				{
-					HostIP:   "127.0.0.1",
-					HostPort: strconv.Itoa(kafkaHostPort),
-				},
-			}
 		},
 	}
 
 	kafkaContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{ContainerRequest: kafkaReq, Started: true})
 	if err != nil {
-		_ = zkContainer.Terminate(ctx)
-		network.Remove(ctx) //nolint:errcheck // best effort cleanup
 		return "", nil, fmt.Errorf("failed to start kafka container: %w", err)
 	}
 
 	cleanup := func() {
 		if err := kafkaContainer.Terminate(ctx); err != nil {
 			log.Printf("failed to terminate kafka container: %v", err)
-		}
-		if err := zkContainer.Terminate(ctx); err != nil {
-			log.Printf("failed to terminate zookeeper container: %v", err)
-		}
-		if err := network.Remove(ctx); err != nil {
-			log.Printf("failed to remove test network: %v", err)
 		}
 	}
 
