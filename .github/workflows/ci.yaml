@@ -16,6 +16,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -42,6 +44,8 @@ jobs:
           go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.60.3
 
       - name: Run aggregated CI checks
+        env:
+          PROTO_BREAKING_BASE_BRANCH: ${{ github.event.pull_request.base.ref || 'main' }}
         run: make ci
 
       - name: Run end-to-end tests

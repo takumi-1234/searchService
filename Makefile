@@ -13,7 +13,7 @@ GRPC_TARGET ?= 127.0.0.1:50071
 # Tools
 # ==============================================================================
 # .PHONY ディレクティブは、同名のファイルが存在してもターゲットを実行するようにします。
-.PHONY: all init test test-unit test-integration test-e2e test-load lint fmt fmt-check vet proto-lint ci build run clean docker-build docker-up docker-down docker-logs
+.PHONY: all init test test-unit test-integration test-e2e test-load lint fmt fmt-check vet proto-lint proto-breaking ci build run clean docker-build docker-up docker-down docker-logs
 
 # デフォルトターゲット (make とだけ打った時に実行される)
 all: build
@@ -160,11 +160,18 @@ proto-lint:
 	@echo ">> Running buf lint..."
 	buf lint
 
+# proto-breaking: protobuf の後方互換性検証を実行します
+proto-breaking:
+	@echo ">> Checking protobuf backward compatibility..."
+	@git fetch origin $${PROTO_BREAKING_BASE_BRANCH:-main}:refs/heads/_buf_break_base >/dev/null 2>&1
+	buf breaking --against ".git#branch=_buf_break_base"
+
 # ci: CIで実行する検証をまとめて実行します
 ci:
 	@echo ">> Running aggregated CI checks..."
 	$(MAKE) fmt-check
 	$(MAKE) proto-lint
+	$(MAKE) proto-breaking
 	$(MAKE) lint
 	$(MAKE) vet
 	$(MAKE) test-unit

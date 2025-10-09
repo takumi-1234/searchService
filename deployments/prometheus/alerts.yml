@@ -1,0 +1,19 @@
+groups:
+  - name: search-service-kafka
+    rules:
+      - alert: SearchServiceKafkaDLQMessagesHigh
+        expr: increase(kafka_consumer_messages_dlq_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Search service is sending messages to the DLQ
+          description: A sustained increase in DLQ traffic indicates downstream indexing failures. Inspect logs and the DLQ topic.
+      - alert: SearchServiceKafkaLagHigh
+        expr: max_over_time(kafka_consumer_partition_lag[5m]) > 1000
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Search service Kafka consumer lag is elevated
+          description: Consumer lag above 1000 messages for 5m suggests the service is falling behind. Scale consumers or investigate broker health.

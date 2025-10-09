@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
@@ -40,6 +42,9 @@ type Consumer struct {
 	initialBackoff    time.Duration
 	maxBackoff        time.Duration
 	backoffMultiplier float64
+	metrics           *consumerMetrics
+	lagMu             sync.RWMutex
+	lagByPartition    map[string]map[int32]int64
 }
 
 const (
@@ -48,6 +53,7 @@ const (
 	defaultMaxBackoff        = 5 * time.Second
 	defaultBackoffMultiplier = 2.0
 	producerFlushTimeout     = 5 * time.Second
+	messagingSystemKafka     = "kafka"
 )
 
 // Option はConsumerのオプションを設定します。
@@ -91,6 +97,23 @@ func WithRetryConfig(cfg RetryConfig) Option {
 	}
 }
 
+type consumerMetrics struct {
+	processCounter  metric.Int64Counter
+	retryCounter    metric.Int64Counter
+	dlqCounter      metric.Int64Counter
+	lagGauge        metric.Int64ObservableGauge
+	lagRegistration metric.Registration
+}
+
+func (m *consumerMetrics) unregister() {
+	if m == nil {
+		return
+	}
+	if m.lagRegistration != nil {
+		m.lagRegistration.Unregister()
+	}
+}
+
 // NewConsumer は新しいConsumerインスタンスを生成します。
 func NewConsumer(consumer *kafka.Consumer, producer *kafka.Producer, svc port.SearchService, logger *zap.Logger, topic string, opts ...Option) *Consumer {
 	c := &Consumer{
@@ -104,6 +127,7 @@ func NewConsumer(consumer *kafka.Consumer, producer *kafka.Producer, svc port.Se
 		initialBackoff:    defaultInitialBackoff,
 		maxBackoff:        defaultMaxBackoff,
 		backoffMultiplier: defaultBackoffMultiplier,
+		lagByPartition:    make(map[string]map[int32]int64),
 	}
 
 	for _, opt := range opts {
@@ -120,7 +144,157 @@ func NewConsumer(consumer *kafka.Consumer, producer *kafka.Producer, svc port.Se
 		c.maxBackoff = defaultMaxBackoff
 	}
 
+	c.initMetrics()
+
 	return c
+}
+
+func (c *Consumer) initMetrics() {
+	meter := otel.Meter("github.com/takumi-1234/searchService/internal/adapter/message")
+
+	processCounter, err := meter.Int64Counter(
+		"kafka.consumer.messages_total",
+		metric.WithDescription("Total number of Kafka messages processed by outcome"),
+	)
+	if err != nil {
+		c.logger.Warn("failed to create kafka messages counter", zap.Error(err))
+		return
+	}
+
+	retryCounter, err := meter.Int64Counter(
+		"kafka.consumer.retries_total",
+		metric.WithDescription("Total number of Kafka message retry attempts"),
+	)
+	if err != nil {
+		c.logger.Warn("failed to create kafka retry counter", zap.Error(err))
+		return
+	}
+
+	dlqCounter, err := meter.Int64Counter(
+		"kafka.consumer.messages_dlq_total",
+		metric.WithDescription("Total number of Kafka messages sent to the dead-letter topic"),
+	)
+	if err != nil {
+		c.logger.Warn("failed to create kafka DLQ counter", zap.Error(err))
+		return
+	}
+
+	lagGauge, err := meter.Int64ObservableGauge(
+		"kafka.consumer.partition_lag",
+		metric.WithDescription("Observed lag between the high watermark and the processed offset"),
+		metric.WithUnit("1"),
+	)
+	if err != nil {
+		c.logger.Warn("failed to create kafka lag gauge", zap.Error(err))
+		return
+	}
+
+	registration, err := meter.RegisterCallback(func(ctx context.Context, observer metric.Observer) error {
+		c.lagMu.RLock()
+		defer c.lagMu.RUnlock()
+		for topic, partitions := range c.lagByPartition {
+			for partition, lag := range partitions {
+				observer.ObserveInt64(lagGauge, lag,
+					metric.WithAttributes(
+						attribute.String("messaging.system", messagingSystemKafka),
+						attribute.String("messaging.destination", topic),
+						attribute.Int("messaging.kafka.partition", int(partition)),
+					),
+				)
+			}
+		}
+		return nil
+	}, lagGauge)
+	if err != nil {
+		c.logger.Warn("failed to register kafka lag callback", zap.Error(err))
+		return
+	}
+
+	c.metrics = &consumerMetrics{
+		processCounter:  processCounter,
+		retryCounter:    retryCounter,
+		dlqCounter:      dlqCounter,
+		lagGauge:        lagGauge,
+		lagRegistration: registration,
+	}
+}
+
+func (c *Consumer) recordProcessed(ctx context.Context, topic, outcome string) {
+	if c.metrics == nil {
+		return
+	}
+
+	attrs := []attribute.KeyValue{
+		attribute.String("messaging.system", messagingSystemKafka),
+		attribute.String("outcome", outcome),
+	}
+	if topic != "" {
+		attrs = append(attrs, attribute.String("messaging.destination", topic))
+	}
+
+	c.metrics.processCounter.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+func (c *Consumer) recordRetry(ctx context.Context, topic string) {
+	if c.metrics == nil {
+		return
+	}
+
+	attrs := []attribute.KeyValue{
+		attribute.String("messaging.system", messagingSystemKafka),
+	}
+	if topic != "" {
+		attrs = append(attrs, attribute.String("messaging.destination", topic))
+	}
+	c.metrics.retryCounter.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+func (c *Consumer) recordDLQ(ctx context.Context, topic string) {
+	if c.metrics == nil {
+		return
+	}
+
+	attrs := []attribute.KeyValue{
+		attribute.String("messaging.system", messagingSystemKafka),
+		attribute.String("destination_kind", "dlq"),
+	}
+	if topic != "" {
+		attrs = append(attrs, attribute.String("messaging.destination", topic))
+	}
+	c.metrics.dlqCounter.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+func (c *Consumer) updateLag(topic string, partition int32, offset kafka.Offset) {
+	if c.metrics == nil || topic == "" || c.consumer == nil {
+		return
+	}
+
+	low, high, err := c.consumer.GetWatermarkOffsets(topic, partition)
+	if err != nil {
+		c.logger.Debug("failed to get watermark offsets for lag calculation",
+			zap.String("topic", topic),
+			zap.Int32("partition", partition),
+			zap.Error(err),
+		)
+		return
+	}
+	_ = low // currently unused but retained for clarity and future usage
+
+	current := int64(offset)
+	lag := high - (current + 1)
+	if lag < 0 {
+		lag = 0
+	}
+
+	c.lagMu.Lock()
+	defer c.lagMu.Unlock()
+
+	partitions := c.lagByPartition[topic]
+	if partitions == nil {
+		partitions = make(map[int32]int64)
+		c.lagByPartition[topic] = partitions
+	}
+	partitions[partition] = lag
 }
 
 // Run はKafkaコンシューマを開始します。
@@ -155,8 +329,12 @@ func (c *Consumer) Run(ctx context.Context) error {
 			}
 
 			if err := c.processMessage(ctx, msg); err != nil {
+				logTopic := ""
+				if msg.TopicPartition.Topic != nil {
+					logTopic = *msg.TopicPartition.Topic
+				}
 				c.logger.Error("failed to handle kafka message",
-					zap.String("topic", *msg.TopicPartition.Topic),
+					zap.String("topic", logTopic),
 					zap.ByteString("key", msg.Key),
 					zap.Error(err),
 				)
@@ -199,7 +377,7 @@ func (c *Consumer) processMessage(ctx context.Context, msg *kafka.Message) error
 		if lastErr == nil {
 			if attempt > 0 {
 				c.logger.Info("message processed after retry",
-					zap.String("topic", *msg.TopicPartition.Topic),
+					zap.String("topic", topic),
 					zap.Int("attempts", attempt+1),
 				)
 				span.AddEvent("message processed after retry",
@@ -208,16 +386,19 @@ func (c *Consumer) processMessage(ctx context.Context, msg *kafka.Message) error
 			}
 			span.SetAttributes(attribute.Int("messaging.kafka.retry_count", attempt))
 			span.SetStatus(codes.Ok, "processed")
+			c.recordProcessed(ctx, topic, "success")
+			c.updateLag(topic, msg.TopicPartition.Partition, msg.TopicPartition.Offset)
 			return nil
 		}
 
 		span.RecordError(lastErr, trace.WithAttributes(
 			attribute.Int("messaging.kafka.retry_attempt", attempt),
 		))
+		c.recordRetry(ctx, topic)
 
 		if attempt == c.maxRetries {
 			c.logger.Error("exhausted message retries, sending to DLQ",
-				zap.String("topic", *msg.TopicPartition.Topic),
+				zap.String("topic", topic),
 				zap.Int("attempts", attempt+1),
 				zap.Error(lastErr),
 			)
@@ -228,13 +409,15 @@ func (c *Consumer) processMessage(ctx context.Context, msg *kafka.Message) error
 				span.SetStatus(codes.Error, err.Error())
 				return errors.Join(lastErr, err)
 			}
+			c.recordProcessed(ctx, topic, "failed")
+			c.recordDLQ(ctx, topic)
 			span.AddEvent("message sent to DLQ")
 			span.SetStatus(codes.Error, lastErr.Error())
 			return lastErr
 		}
 
 		c.logger.Warn("message processing failed, will retry",
-			zap.String("topic", *msg.TopicPartition.Topic),
+			zap.String("topic", topic),
 			zap.Int("attempt", attempt+1),
 			zap.Duration("backoff", backoff),
 			zap.Error(lastErr),
@@ -330,6 +513,10 @@ func (c *Consumer) close() error {
 		}
 		_ = c.producer.Flush(flushTimeout)
 		c.producer.Close()
+	}
+
+	if c.metrics != nil {
+		c.metrics.unregister()
 	}
 
 	return closeErr
