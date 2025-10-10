@@ -68,14 +68,20 @@ func newTestQdrantConn(t *testing.T, pointsServer qdrant.PointsServer) (*grpc.Cl
 	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		grpcServer.Stop()
-		lis.Close()
+		if cerr := lis.Close(); cerr != nil {
+			t.Logf("failed to close listener: %v", cerr)
+		}
 		t.Fatalf("failed to dial test server: %v", err)
 	}
 
 	cleanup := func() {
-		_ = conn.Close()
+		if cerr := conn.Close(); cerr != nil {
+			t.Logf("failed to close test connection: %v", cerr)
+		}
 		grpcServer.Stop()
-		_ = lis.Close()
+		if cerr := lis.Close(); cerr != nil {
+			t.Logf("failed to close listener: %v", cerr)
+		}
 	}
 
 	return conn, cleanup
@@ -95,7 +101,11 @@ func TestSearchRepositoryKeywordSearch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to read body: %v", err)
 		}
-		defer req.Body.Close()
+		defer func() {
+			if cerr := req.Body.Close(); cerr != nil {
+				t.Fatalf("failed to close request body: %v", cerr)
+			}
+		}()
 
 		if err := json.Unmarshal(body, &capturedBody); err != nil {
 			t.Fatalf("failed to unmarshal request body: %v", err)

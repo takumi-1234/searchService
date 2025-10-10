@@ -97,7 +97,11 @@ func main() {
 	if err != nil {
 		logger.Fatal("failed to connect to qdrant", zap.Error(err))
 	}
-	defer qdrantConn.Close()
+	defer func() {
+		if err := qdrantConn.Close(); err != nil {
+			logger.Warn("failed to close qdrant connection", zap.Error(err))
+		}
+	}()
 
 	// 統合リポジトリのインスタンス化
 	searchRepo := repository.NewSearchRepository(esTypedClient, qdrantConn)
@@ -123,6 +127,10 @@ func main() {
 	})
 	if err != nil {
 		logger.Fatal("failed to create kafka producer", zap.Error(err))
+	}
+
+	if err := ensureKafkaTopic(ctx, cfg.Kafka.Topic, cfg.Kafka.Brokers, logger); err != nil {
+		logger.Fatal("failed to ensure kafka topic", zap.Error(err))
 	}
 
 	msgConsumer := message_adapter.NewConsumer(consumer, producer, searchSvc, logger, cfg.Kafka.Topic)
@@ -191,4 +199,103 @@ func main() {
 		logger.Error("background worker exited with error", zap.Error(err))
 	}
 	logger.Info("server gracefully stopped")
+}
+
+func ensureKafkaTopic(ctx context.Context, topic string, brokers []string, logger *zap.Logger) error {
+	admin, err := kafka.NewAdminClient(&kafka.ConfigMap{
+		"bootstrap.servers": strings.Join(brokers, ","),
+	})
+	if err != nil {
+		return fmt.Errorf("create kafka admin client: %w", err)
+	}
+	defer admin.Close()
+
+	spec := kafka.TopicSpecification{
+		Topic:             topic,
+		NumPartitions:     1,
+		ReplicationFactor: 1,
+	}
+
+	ensureCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	var attempt int
+	backoff := time.Second
+	const maxBackoff = 15 * time.Second
+	var lastErr error
+
+	for {
+		attempt++
+
+		select {
+		case <-ensureCtx.Done():
+			if lastErr != nil {
+				return fmt.Errorf("request kafka topic creation: %w", lastErr)
+			}
+			return fmt.Errorf("request kafka topic creation: %w", ensureCtx.Err())
+		default:
+		}
+
+		attemptCtx, attemptCancel := context.WithTimeout(ensureCtx, 10*time.Second)
+		results, err := admin.CreateTopics(attemptCtx, []kafka.TopicSpecification{spec})
+		attemptCancel()
+
+		if err == nil && len(results) > 0 {
+			res := results[0]
+			switch res.Error.Code() {
+			case kafka.ErrNoError, kafka.ErrTopicAlreadyExists:
+				if res.Error.Code() == kafka.ErrNoError {
+					logger.Info("kafka topic created", zap.String("topic", res.Topic))
+				} else {
+					logger.Debug("kafka topic already exists", zap.String("topic", res.Topic))
+				}
+				return nil
+			default:
+				lastErr = res.Error
+			}
+		} else if err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+
+		if !isKafkaRetryable(lastErr) {
+			return fmt.Errorf("kafka topic creation failed: %w", lastErr)
+		}
+
+		logger.Warn("waiting for kafka admin APIs to become ready",
+			zap.Error(lastErr),
+			zap.Int("attempt", attempt),
+			zap.Duration("backoff", backoff),
+		)
+
+		select {
+		case <-ensureCtx.Done():
+			return fmt.Errorf("request kafka topic creation: %w", ensureCtx.Err())
+		case <-time.After(backoff):
+		}
+
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
+func isKafkaRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var kErr kafka.Error
+	if errors.As(err, &kErr) {
+		if kErr.Code() == kafka.ErrTopicAlreadyExists {
+			return false
+		}
+		return kErr.IsRetriable() || kErr.IsTimeout() || kErr.Code() == kafka.ErrTransport || kErr.Code() == kafka.ErrAllBrokersDown
+	}
+
+	return false
 }

@@ -17,7 +17,11 @@ func main() {
 		fmt.Println("出力ファイル作成エラー:", err)
 		return
 	}
-	defer out.Close()
+	defer func() {
+		if cerr := out.Close(); cerr != nil {
+			fmt.Println("出力ファイルクローズエラー:", cerr)
+		}
+	}()
 
 	err = filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {

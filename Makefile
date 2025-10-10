@@ -4,7 +4,13 @@
 BINARY_NAME=search-service
 BINARY_PATH=./cmd/server/main.go
 OUTPUT_DIR=./bin
-GO_SOURCES := $(shell find . -name '*.go' -not -path './gen/*' -not -path './bin/*' -not -path './.git/*')
+GO_SOURCES_CMD := find . -name '*.go' \
+	-not -path './gen/*' \
+	-not -path './bin/*' \
+	-not -path './.git/*' \
+	-not -path './.cache/*' -print0
+BUF_VERSION ?= v1.31.0
+BUF_PKG := github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION)
 K6_VUS ?= 10
 K6_DURATION ?= 30s
 GRPC_TARGET ?= 127.0.0.1:50071
@@ -28,6 +34,14 @@ init:
 	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2
 	go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
 	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+	$(MAKE) install-buf
+
+# install-buf: Buf CLI をインストールします (必要に応じて)
+install-buf:
+	@command -v buf >/dev/null 2>&1 || { \
+		echo ">> Installing buf CLI ($(BUF_PKG))..."; \
+		go install $(BUF_PKG); \
+	}
 
 # test: 全てのテスト（ユニット + インテグレーション）を実行します
 test: test-unit test-integration
@@ -134,7 +148,7 @@ fmt-check:
 		echo "goimports is not installed. Run 'go install golang.org/x/tools/cmd/goimports@latest' first."; \
 		exit 1; \
 	}
-	@UNFORMATTED=$$(goimports -l $(GO_SOURCES)); \
+	@UNFORMATTED=$$($(GO_SOURCES_CMD) | xargs -0 goimports -l); \
 	if [ -n "$$UNFORMATTED" ]; then \
 		echo "The following files are not properly formatted (run 'make fmt'):"; \
 		echo "$$UNFORMATTED"; \
@@ -158,13 +172,32 @@ vet:
 # proto-lint: Buf を用いて protobuf の lint を実行します
 proto-lint:
 	@echo ">> Running buf lint..."
+	$(MAKE) install-buf
 	buf lint
 
 # proto-breaking: protobuf の後方互換性検証を実行します
 proto-breaking:
 	@echo ">> Checking protobuf backward compatibility..."
-	@git fetch origin $${PROTO_BREAKING_BASE_BRANCH:-main}:refs/heads/_buf_break_base >/dev/null 2>&1
-	buf breaking --against ".git#branch=_buf_break_base"
+	$(MAKE) install-buf
+	@BASE_BRANCH=$${PROTO_BREAKING_BASE_BRANCH:-main}; \
+	BASE_REF=$${PROTO_BREAKING_BASE_REF:-}; \
+	if [ -z "$$BASE_REF" ] && git show-ref --verify --quiet "refs/heads/$$BASE_BRANCH"; then \
+		BASE_REF=".git#branch=$$BASE_BRANCH"; \
+	fi; \
+	if [ -z "$$BASE_REF" ]; then \
+		if git remote get-url origin >/dev/null 2>&1; then \
+			if git fetch origin "$$BASE_BRANCH:refs/heads/_buf_break_base" >/dev/null 2>&1; then \
+				BASE_REF=".git#branch=_buf_break_base"; \
+			else \
+				echo "Warning: failed to fetch origin/$$BASE_BRANCH for buf breaking; skipping backward-compatibility check. Set PROTO_BREAKING_BASE_BRANCH or PROTO_BREAKING_BASE_REF to override." >&2; \
+				exit 0; \
+			fi; \
+		else \
+			echo "Warning: git remote 'origin' not configured; skipping buf breaking. Set PROTO_BREAKING_BASE_REF to a reference for comparison." >&2; \
+			exit 0; \
+		fi; \
+	fi; \
+	buf breaking --against "$$BASE_REF"
 
 # ci: CIで実行する検証をまとめて実行します
 ci:

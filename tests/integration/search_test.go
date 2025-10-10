@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"github.com/docker/go-connections/nat"
 	"github.com/elastic/go-elasticsearch/v9"
 	"github.com/elastic/go-elasticsearch/v9/typedapi/types/enums/refresh"
+	"github.com/google/uuid"
 	"github.com/qdrant/go-client/qdrant"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -126,11 +128,13 @@ func setupKafka(ctx context.Context) (string, func(), error) {
 	const (
 		containerKafkaPort       = "9092/tcp"
 		containerControllerPort  = "9093/tcp"
-		clusterIDBase64          = "ZHVtbXkta3JhZnQtY2x1c3Rlci0x"
 		controllerListenerName   = "CONTROLLER"
 		controllerListenerConfig = "CONTROLLER://0.0.0.0:9093"
 		kafkaReadyLog            = "Kafka Server started"
 	)
+
+	clusterUUID := uuid.New()
+	clusterIDBase64 := base64.RawStdEncoding.EncodeToString(clusterUUID[:])
 
 	kafkaHostPort, err := getFreePort()
 	if err != nil {
@@ -142,7 +146,7 @@ func setupKafka(ctx context.Context) (string, func(), error) {
 		Env: map[string]string{
 			"KAFKA_ENABLE_KRAFT":                             "true",
 			"KAFKA_PROCESS_ROLES":                            "broker,controller",
-			"KAFKA_CLUSTER_ID":                               clusterIDBase64,
+			"CLUSTER_ID":                                     clusterIDBase64,
 			"KAFKA_NODE_ID":                                  "1",
 			"KAFKA_LISTENER_SECURITY_PROTOCOL_MAP":           "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT",
 			"KAFKA_LISTENERS":                                fmt.Sprintf("PLAINTEXT://0.0.0.0:9092,%s", controllerListenerConfig),

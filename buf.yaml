@@ -1,7 +1,10 @@
 version: v1beta1
 build:
   roots:
-    - api
+    - .
+  excludes:
+    - .cache
+    - tests/perf/proto
 deps:
   - buf.build/googleapis/googleapis
 lint:
