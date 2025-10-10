@@ -11,6 +11,7 @@ GO_SOURCES_CMD := find . -name '*.go' \
 	-not -path './.cache/*' -print0
 BUF_VERSION ?= v1.31.0
 BUF_PKG := github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION)
+PROTO_BREAKING_DEFAULT_BRANCHES ?= main master
 K6_VUS ?= 10
 K6_DURATION ?= 30s
 GRPC_TARGET ?= 127.0.0.1:50071
@@ -179,17 +180,33 @@ proto-lint:
 proto-breaking:
 	@echo ">> Checking protobuf backward compatibility..."
 	$(MAKE) install-buf
-	@BASE_BRANCH=$${PROTO_BREAKING_BASE_BRANCH:-main}; \
+	@BASE_BRANCH=$${PROTO_BREAKING_BASE_BRANCH:-}; \
 	BASE_REF=$${PROTO_BREAKING_BASE_REF:-}; \
-	if [ -z "$$BASE_REF" ] && git show-ref --verify --quiet "refs/heads/$$BASE_BRANCH"; then \
-		BASE_REF=".git#branch=$$BASE_BRANCH"; \
+	DEFAULT_BRANCHES="$(PROTO_BREAKING_DEFAULT_BRANCHES)"; \
+	if [ -z "$$BASE_BRANCH" ]; then \
+		CANDIDATE_BRANCHES="$$DEFAULT_BRANCHES"; \
+	else \
+		CANDIDATE_BRANCHES="$$BASE_BRANCH"; \
 	fi; \
+	for BRANCH in $$CANDIDATE_BRANCHES; do \
+		if [ -n "$$BASE_REF" ]; then \
+			break; \
+		fi; \
+		if git show-ref --verify --quiet "refs/heads/$$BRANCH"; then \
+			BASE_REF=".git#branch=$$BRANCH"; \
+			break; \
+		fi; \
+	done; \
 	if [ -z "$$BASE_REF" ]; then \
 		if git remote get-url origin >/dev/null 2>&1; then \
-			if git fetch origin "$$BASE_BRANCH:refs/heads/_buf_break_base" >/dev/null 2>&1; then \
-				BASE_REF=".git#branch=_buf_break_base"; \
-			else \
-				echo "Warning: failed to fetch origin/$$BASE_BRANCH for buf breaking; skipping backward-compatibility check. Set PROTO_BREAKING_BASE_BRANCH or PROTO_BREAKING_BASE_REF to override." >&2; \
+			for BRANCH in $$CANDIDATE_BRANCHES; do \
+				if git fetch origin "$$BRANCH:refs/heads/_buf_break_base" >/dev/null 2>&1; then \
+					BASE_REF=".git#branch=_buf_break_base"; \
+					break; \
+				fi; \
+			done; \
+			if [ -z "$$BASE_REF" ]; then \
+				echo "Warning: failed to fetch any of '$$CANDIDATE_BRANCHES' from origin for buf breaking; skipping backward-compatibility check. Set PROTO_BREAKING_BASE_BRANCH or PROTO_BREAKING_BASE_REF to override." >&2; \
 				exit 0; \
 			fi; \
 		else \

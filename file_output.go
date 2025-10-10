@@ -12,6 +12,12 @@ const outputFile = "output.txt"
 
 func main() {
 	rootDir := "." // カレントディレクトリ
+	rootAbs, err := filepath.Abs(rootDir)
+	if err != nil {
+		fmt.Println("ルートディレクトリ解決エラー:", err)
+		return
+	}
+
 	out, err := os.Create(outputFile)
 	if err != nil {
 		fmt.Println("出力ファイル作成エラー:", err)
@@ -23,7 +29,7 @@ func main() {
 		}
 	}()
 
-	err = filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(rootAbs, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -48,13 +54,27 @@ func main() {
 			return nil
 		}
 
-		content, err := os.ReadFile(path)
+		cleanPath := filepath.Clean(path)
+		if !strings.HasPrefix(cleanPath, rootAbs+string(os.PathSeparator)) && cleanPath != rootAbs {
+			return nil
+		}
+
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+
+		content, err := os.ReadFile(cleanPath)
 		if err != nil {
 			return err
 		}
 
+		relPath, relErr := filepath.Rel(rootAbs, cleanPath)
+		if relErr != nil {
+			relPath = cleanPath
+		}
+
 		// エラーをすべてチェック
-		if _, err := fmt.Fprintf(out, "```%s \n# %s\n\n", lang, path); err != nil {
+		if _, err := fmt.Fprintf(out, "```%s \n# %s\n\n", lang, relPath); err != nil {
 			return err
 		}
 		if _, err := out.Write(content); err != nil {

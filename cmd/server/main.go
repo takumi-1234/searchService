@@ -77,8 +77,12 @@ func main() {
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", obsProvider.MetricsHandler())
 	metricsServer := &http.Server{
-		Addr:    cfg.Observability.Metrics.Address,
-		Handler: metricsMux,
+		Addr:              cfg.Observability.Metrics.Address,
+		Handler:           metricsMux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Elasticsearchクライアントの初期化
