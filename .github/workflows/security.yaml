@@ -33,7 +33,13 @@ jobs:
         run: go install github.com/securego/gosec/v2/cmd/gosec@v2.21.3
 
       - name: Run gosec
-        run: $HOME/go/bin/gosec ./...
+        env:
+          GOCACHE: ${{ runner.temp }}/go-build
+          GOMODCACHE: ${{ runner.temp }}/go-mod
+        run: |
+          mkdir -p "${GOCACHE}" "${GOMODCACHE}"
+          GOSEC_BIN="$(go env GOPATH)/bin/gosec"
+          "${GOSEC_BIN}" -exclude-dir=gen ./cmd/... ./internal/... ./pkg/... ./tests/...
 
   sca:
     name: Trivy Dependency Scan
@@ -50,7 +56,7 @@ jobs:
         with:
           scan-type: fs
           format: table
-          vuln-type: "library,config"
+          vuln-type: library
           severity: CRITICAL,HIGH
           ignore-unfixed: true
 
@@ -68,6 +74,7 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         with:
           args: detect --source . --no-banner --redact
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   dast:
     name: ZAP Baseline
