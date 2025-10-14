@@ -251,12 +251,12 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
 
-	searchv1 "github.com/takumi-1234/searchService/gen/proto/search/v1"
-	grpc_adapter "github.com/takumi-1234/searchService/internal/adapter/grpc"
-	message_adapter "github.com/takumi-1234/searchService/internal/adapter/message"
-	"github.com/takumi-1234/searchService/internal/config"
-	"github.com/takumi-1234/searchService/internal/repository"
-	"github.com/takumi-1234/searchService/internal/service"
+	searchv1 "github.com/ttokunaga-jp/searchService/gen/proto/search/v1"
+	grpc_adapter "github.com/ttokunaga-jp/searchService/internal/adapter/grpc"
+	message_adapter "github.com/ttokunaga-jp/searchService/internal/adapter/message"
+	"github.com/ttokunaga-jp/searchService/internal/config"
+	"github.com/ttokunaga-jp/searchService/internal/repository"
+	"github.com/ttokunaga-jp/searchService/internal/service"
 )
 
 func main() {
@@ -1691,7 +1691,7 @@ const file_proto_search_v1_search_proto_rawDesc = "" +
 	"\x14DISTANCE_DOT_PRODUCT\x10\x032\xa4\x02\n" +
 	"\rSearchService\x12\x98\x01\n" +
 	"\x0fSearchDocuments\x12+.api.proto.search.v1.SearchDocumentsRequest\x1a,.api.proto.search.v1.SearchDocumentsResponse\"*\x82\xd3\xe4\x93\x02$:\x01*\"\x1f/v1/indexes/{index_name}/search\x12x\n" +
-	"\vCreateIndex\x12'.api.proto.search.v1.CreateIndexRequest\x1a(.api.proto.search.v1.CreateIndexResponse\"\x16\x82\xd3\xe4\x93\x02\x10:\x01*\"\v/v1/indexesB=Z;github.com/takumi-1234/searchService/gen/search/v1;searchv1b\x06proto3"
+	"\vCreateIndex\x12'.api.proto.search.v1.CreateIndexRequest\x1a(.api.proto.search.v1.CreateIndexResponse\"\x16\x82\xd3\xe4\x93\x02\x10:\x01*\"\v/v1/indexesB=Z;github.com/ttokunaga-jp/searchService/gen/search/v1;searchv1b\x06proto3"
 
 var (
 	file_proto_search_v1_search_proto_rawDescOnce sync.Once
@@ -1961,8 +1961,8 @@ import (
 
 	"go.uber.org/zap"
 
-	searchv1 "github.com/takumi-1234/searchService/gen/proto/search/v1"
-	"github.com/takumi-1234/searchService/internal/port"
+	searchv1 "github.com/ttokunaga-jp/searchService/gen/proto/search/v1"
+	"github.com/ttokunaga-jp/searchService/internal/port"
 )
 
 // Server は gRPC サーバーの実装です。
@@ -2153,8 +2153,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	searchv1 "github.com/takumi-1234/searchService/gen/proto/search/v1"
-	"github.com/takumi-1234/searchService/internal/port"
+	searchv1 "github.com/ttokunaga-jp/searchService/gen/proto/search/v1"
+	"github.com/ttokunaga-jp/searchService/internal/port"
 )
 
 // MockSearchService は port.SearchService のモックです。
@@ -2384,7 +2384,7 @@ import (
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"go.uber.org/zap"
 
-	"github.com/takumi-1234/searchService/internal/port"
+	"github.com/ttokunaga-jp/searchService/internal/port"
 )
 
 // DocumentIndexRequest はKafkaメッセージのペイロードスキーマです。
@@ -2802,7 +2802,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/takumi-1234/searchService/internal/port"
+	"github.com/ttokunaga-jp/searchService/internal/port"
 )
 
 // searchRepository は Elasticsearch と Qdrant の両方との通信を担当します。
@@ -3233,7 +3233,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/takumi-1234/searchService/internal/port"
+	"github.com/ttokunaga-jp/searchService/internal/port"
 )
 
 // searchService は SearchRepository に依存する。
@@ -3460,7 +3460,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"go.uber.org/zap"
 
-	"github.com/takumi-1234/searchService/internal/port"
+	"github.com/ttokunaga-jp/searchService/internal/port"
 )
 
 // MockSearchRepository は port.SearchRepository のモック。
@@ -3710,11 +3710,11 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	searchv1 "github.com/takumi-1234/searchService/gen/proto/search/v1"
-	grpc_adapter "github.com/takumi-1234/searchService/internal/adapter/grpc"
-	message_adapter "github.com/takumi-1234/searchService/internal/adapter/message"
-	"github.com/takumi-1234/searchService/internal/repository"
-	"github.com/takumi-1234/searchService/internal/service"
+	searchv1 "github.com/ttokunaga-jp/searchService/gen/proto/search/v1"
+	grpc_adapter "github.com/ttokunaga-jp/searchService/internal/adapter/grpc"
+	message_adapter "github.com/ttokunaga-jp/searchService/internal/adapter/message"
+	"github.com/ttokunaga-jp/searchService/internal/repository"
+	"github.com/ttokunaga-jp/searchService/internal/service"
 )
 
 // setupElasticsearch は Elasticsearch の testcontainer をセットアップします。

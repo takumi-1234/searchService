@@ -33,12 +33,12 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	searchv1 "github.com/takumi-1234/searchService/gen/proto/search/v1"
-	grpc_adapter "github.com/takumi-1234/searchService/internal/adapter/grpc"
-	message_adapter "github.com/takumi-1234/searchService/internal/adapter/message"
-	"github.com/takumi-1234/searchService/internal/port"
-	"github.com/takumi-1234/searchService/internal/repository"
-	"github.com/takumi-1234/searchService/internal/service"
+	searchv1 "github.com/ttokunaga-jp/searchService/gen/proto/search/v1"
+	grpc_adapter "github.com/ttokunaga-jp/searchService/internal/adapter/grpc"
+	message_adapter "github.com/ttokunaga-jp/searchService/internal/adapter/message"
+	"github.com/ttokunaga-jp/searchService/internal/port"
+	"github.com/ttokunaga-jp/searchService/internal/repository"
+	"github.com/ttokunaga-jp/searchService/internal/service"
 )
 
 // setupElasticsearch は Elasticsearch の testcontainer をセットアップします。

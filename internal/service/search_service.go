@@ -12,7 +12,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/takumi-1234/searchService/internal/port"
+	"github.com/ttokunaga-jp/searchService/internal/port"
 )
 
 // HybridWeights はハイブリッド検索における各スコアの重みを表現します。

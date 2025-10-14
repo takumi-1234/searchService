@@ -22,13 +22,13 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
 
-	searchv1 "github.com/takumi-1234/searchService/gen/proto/search/v1"
-	grpc_adapter "github.com/takumi-1234/searchService/internal/adapter/grpc"
-	message_adapter "github.com/takumi-1234/searchService/internal/adapter/message"
-	"github.com/takumi-1234/searchService/internal/config"
-	"github.com/takumi-1234/searchService/internal/repository"
-	"github.com/takumi-1234/searchService/internal/service"
-	"github.com/takumi-1234/searchService/pkg/observability"
+	searchv1 "github.com/ttokunaga-jp/searchService/gen/proto/search/v1"
+	grpc_adapter "github.com/ttokunaga-jp/searchService/internal/adapter/grpc"
+	message_adapter "github.com/ttokunaga-jp/searchService/internal/adapter/message"
+	"github.com/ttokunaga-jp/searchService/internal/config"
+	"github.com/ttokunaga-jp/searchService/internal/repository"
+	"github.com/ttokunaga-jp/searchService/internal/service"
+	"github.com/ttokunaga-jp/searchService/pkg/observability"
 )
 
 func main() {
@@ -145,7 +145,7 @@ func main() {
 		logger.Fatal("failed to listen", zap.Int("port", port), zap.Error(err))
 	}
 
-	meter := otel.Meter("github.com/takumi-1234/searchService/internal/adapter/grpc")
+	meter := otel.Meter("github.com/ttokunaga-jp/searchService/internal/adapter/grpc")
 	metricsInterceptor, err := grpc_adapter.NewUnaryMetricsInterceptor(meter)
 	if err != nil {
 		logger.Fatal("failed to create metrics interceptor", zap.Error(err))

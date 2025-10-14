@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"go.uber.org/zap"
 
-	"github.com/takumi-1234/searchService/internal/port"
+	"github.com/ttokunaga-jp/searchService/internal/port"
 )
 
 // MockSearchRepository は port.SearchRepository のモック。

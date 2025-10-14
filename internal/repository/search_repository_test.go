@@ -8,7 +8,7 @@ import (
 	"github.com/elastic/go-elasticsearch/v9/typedapi/types/enums/sortorder"
 	"github.com/qdrant/go-client/qdrant"
 
-	"github.com/takumi-1234/searchService/internal/port"
+	"github.com/ttokunaga-jp/searchService/internal/port"
 )
 
 func TestBuildElasticsearchBoolQuery(t *testing.T) {

@@ -15,7 +15,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/takumi-1234/searchService/internal/port"
+	"github.com/ttokunaga-jp/searchService/internal/port"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

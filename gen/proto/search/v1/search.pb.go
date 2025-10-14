@@ -918,7 +918,7 @@ const file_proto_search_v1_search_proto_rawDesc = "" +
 	"\x14DISTANCE_DOT_PRODUCT\x10\x032\xa4\x02\n" +
 	"\rSearchService\x12\x98\x01\n" +
 	"\x0fSearchDocuments\x12+.api.proto.search.v1.SearchDocumentsRequest\x1a,.api.proto.search.v1.SearchDocumentsResponse\"*\x82\xd3\xe4\x93\x02$:\x01*\"\x1f/v1/indexes/{index_name}/search\x12x\n" +
-	"\vCreateIndex\x12'.api.proto.search.v1.CreateIndexRequest\x1a(.api.proto.search.v1.CreateIndexResponse\"\x16\x82\xd3\xe4\x93\x02\x10:\x01*\"\v/v1/indexesB=Z;github.com/takumi-1234/searchService/gen/search/v1;searchv1b\x06proto3"
+	"\vCreateIndex\x12'.api.proto.search.v1.CreateIndexRequest\x1a(.api.proto.search.v1.CreateIndexResponse\"\x16\x82\xd3\xe4\x93\x02\x10:\x01*\"\v/v1/indexesB=Z;github.com/ttokunaga-jp/searchService/gen/search/v1;searchv1b\x06proto3"
 
 var (
 	file_proto_search_v1_search_proto_rawDescOnce sync.Once

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/takumi-1234/searchService/internal/port"
+	"github.com/ttokunaga-jp/searchService/internal/port"
 )
 
 // ErrIndexAlreadyExists is returned when an index with the same name already exists.

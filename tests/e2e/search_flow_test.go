@@ -17,10 +17,10 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	searchv1 "github.com/takumi-1234/searchService/gen/proto/search/v1"
-	grpcadapter "github.com/takumi-1234/searchService/internal/adapter/grpc"
-	"github.com/takumi-1234/searchService/internal/service"
-	"github.com/takumi-1234/searchService/tests/support/inmemory"
+	searchv1 "github.com/ttokunaga-jp/searchService/gen/proto/search/v1"
+	grpcadapter "github.com/ttokunaga-jp/searchService/internal/adapter/grpc"
+	"github.com/ttokunaga-jp/searchService/internal/service"
+	"github.com/ttokunaga-jp/searchService/tests/support/inmemory"
 )
 
 func TestSearchDocumentsEndToEnd(t *testing.T) {

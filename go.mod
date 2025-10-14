@@ -1,4 +1,4 @@
-module github.com/takumi-1234/searchService
+module github.com/ttokunaga-jp/searchService
 
 go 1.24.0
 
@@ -102,4 +102,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/takumi-1234/searchService => .
+replace github.com/ttokunaga-jp/searchService => .

@@ -16,7 +16,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
-	"github.com/takumi-1234/searchService/internal/port"
+	"github.com/ttokunaga-jp/searchService/internal/port"
 )
 
 // DocumentIndexRequest はKafkaメッセージのペイロードスキーマです。
@@ -148,7 +148,7 @@ func NewConsumer(consumer *kafka.Consumer, producer *kafka.Producer, svc port.Se
 }
 
 func (c *Consumer) initMetrics() {
-	meter := otel.Meter("github.com/takumi-1234/searchService/internal/adapter/message")
+	meter := otel.Meter("github.com/ttokunaga-jp/searchService/internal/adapter/message")
 
 	processCounter, err := meter.Int64Counter(
 		"kafka.consumer.messages_total",
@@ -345,7 +345,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 func (c *Consumer) processMessage(ctx context.Context, msg *kafka.Message) error {
 	var lastErr error
 	backoff := c.initialBackoff
-	tracer := otel.Tracer("github.com/takumi-1234/searchService/internal/adapter/message")
+	tracer := otel.Tracer("github.com/ttokunaga-jp/searchService/internal/adapter/message")
 	topic := ""
 	if msg.TopicPartition.Topic != nil {
 		topic = *msg.TopicPartition.Topic

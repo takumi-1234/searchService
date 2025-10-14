@@ -12,8 +12,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	searchv1 "github.com/takumi-1234/searchService/gen/proto/search/v1"
-	"github.com/takumi-1234/searchService/internal/port"
+	searchv1 "github.com/ttokunaga-jp/searchService/gen/proto/search/v1"
+	"github.com/ttokunaga-jp/searchService/internal/port"
 )
 
 // MockSearchService は port.SearchService のモックです。

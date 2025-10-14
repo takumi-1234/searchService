@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/takumi-1234/searchService/internal/port"
+	"github.com/ttokunaga-jp/searchService/internal/port"
 )
 
 // SeedSampleData populates the repository with a deterministic set of data that

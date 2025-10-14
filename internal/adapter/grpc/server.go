@@ -11,8 +11,8 @@ import (
 
 	"go.uber.org/zap"
 
-	searchv1 "github.com/takumi-1234/searchService/gen/proto/search/v1"
-	"github.com/takumi-1234/searchService/internal/port"
+	searchv1 "github.com/ttokunaga-jp/searchService/gen/proto/search/v1"
+	"github.com/ttokunaga-jp/searchService/internal/port"
 )
 
 // Server は gRPC サーバーの実装です。

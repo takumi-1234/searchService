@@ -11,7 +11,7 @@ updates:
       - "dependencies"
       - "automated"
     reviewers:
-      - "takumi-1234"
+      - "ttokunaga-jp"
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

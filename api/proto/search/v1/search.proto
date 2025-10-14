@@ -5,7 +5,7 @@ package api.proto.search.v1;
 import "google/api/annotations.proto";
 import "google/protobuf/struct.proto";
 
-option go_package = "github.com/takumi-1234/searchService/gen/search/v1;searchv1";
+option go_package = "github.com/ttokunaga-jp/searchService/gen/search/v1;searchv1";
 
 // SearchServiceは、ドキュメントの検索とインデックス管理機能を提供します。
 service SearchService {
